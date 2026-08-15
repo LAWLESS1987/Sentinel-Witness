@@ -1,0 +1,11 @@
+# Core
+flask>=3.0,<4.0
+cryptography>=42.0,<44.0
+
+# Production WSGI server -- see PATCH LOG v8.7 in covenant_unified_v8.py.
+# Pure Python, no C-extension build step, works the same across platforms.
+waitress>=3.0,<4.0
+
+# Trading bridge test/dev dependency only -- not needed to run the node
+# itself, only to exercise covenant_trading_bridge.py's HTTP-level tests.
+requests>=2.31,<3.0

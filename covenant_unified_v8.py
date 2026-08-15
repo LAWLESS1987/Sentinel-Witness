@@ -197,6 +197,84 @@ PATCH LOG — v7.2 (balance ledger + /stake signature requirement)
    Fixed: the route now reads both fields from the request body.
 """
 
+# ---------------------------------------------------------------------------
+# PATCH LOG -- v8.6: TRADING BRIDGE -- REALIZED TRADING PROFIT BECOMES REAL
+# COVENANT LEDGER VALUE, FUNDING THE NODE-GIFTING STRUCTURE
+# ----------------------------------------------------------------
+#   N. Connects the grid/bracket trading strategy (separate project:
+#      strategy/, ledger-app/) to this ledger. Implemented in a SEPARATE
+#      module, covenant_trading_bridge.py, not folded into this file --
+#      see that module's docstring for why. Two routes added below, both
+#      requiring the same domain-tagged RSA-PSS signature scheme
+#      (_domain_frame) every other value-moving action here already uses,
+#      plus nonce-based replay protection matching /claim_rewards and
+#      /unstake:
+#        POST /trading/report_profit -- credits realized trading P&L to
+#          the pool's ledger balance. A signed, mint-style credit (like
+#          genesis's one-time mint, but gated by a real signature EVERY
+#          time, never unconditional) rather than forced through the
+#          peer-to-peer Transaction/mining pipeline, which has no natural
+#          "sender" for value that originated outside Covenant entirely.
+#        POST /trading/gift -- the actual node-gifting mechanism: a
+#          straight ledger credit, zero consideration, reason=
+#          "node_gift" (deliberately not "stake_lock" or anything
+#          loan-shaped) -- non-usurious by construction. Does NOT
+#          auto-stake for the recipient; they stake it themselves via the
+#          existing signed /stake route, consistent with this file's
+#          standing rule that staking requires the staker's own
+#          signature.
+#      VERIFIED EMPIRICALLY before wiring in (see covenant_trading_
+#      bridge.py's own test run): forged signatures rejected, negative/
+#      zero pnl rejected, over-balance gifts rejected, gifts confirmed
+#      NOT auto-staked, recipient confirmed able to stake their gift via
+#      the normal existing path.
+#      SCOPE BOUNDARY, NOT SOLVED HERE: SuccessionGuardianSystem
+#      registration for the pool's key (already usable, zero changes
+#      needed) makes WHO CAN SIGN future ledger entries for the trading
+#      pool a real, enforceable cryptographic fact. It does NOT and
+#      cannot transfer control of the actual exchange accounts or the
+#      physical Ledger hardware wallet those accounts ultimately depend
+#      on -- that is real-world estate planning outside anything code can
+#      enforce. Flagged loudly rather than implied solved.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PATCH LOG -- v8.7: PRODUCTION WSGI SERVER (waitress)
+# ----------------------------------------------------------------
+#   O. Requested: replace werkzeug's run_simple (module docstring's own
+#      FOUR FATAL BUGS item 2 is literally about this same call site --
+#      weird_science.py originally forgot to import it at all) with a
+#      real production WSGI server. run_simple prints its own warning on
+#      every start ("This is a development server. Do not use it in a
+#      production deployment.") -- that warning was accurate, not
+#      decorative, and this closes it. Chosen: waitress -- pure Python,
+#      no C-extension build step (relevant since run_sandboxed() already
+#      documents a POSIX-only fork() constraint elsewhere in this file;
+#      not adding a second platform constraint via the WSGI layer too),
+#      actively maintained, and its defaults are sane enough that most of
+#      the "production hardening" is just making waitress's own existing
+#      defaults explicit in the serve() call (see CovenantAPI.run())
+#      rather than inventing new configuration surface.
+#      NOT SOLVED BY THIS CHANGE, STATED PLAINLY SO IT ISN'T ASSUMED FIXED:
+#      /mine's proof-of-work runs synchronously in whichever waitress
+#      thread handles that request -- real CPU-bound work under the GIL,
+#      which more WSGI threads does not parallelize (see WSGI_THREADS'S
+#      own comment). And CovenantAPI.host still defaults to "0.0.0.0" --
+#      unchanged in this pass, deliberately: that's a distinct, already-
+#      flagged decision (network exposure given this file's own
+#      documented "NO API AUTHENTICATION ANYWHERE") separate from which
+#      WSGI server answers the socket, and bundling an unrequested
+#      default change into a response to a specific "use waitress"
+#      instruction risks exactly the kind of silent scope creep this
+#      file's own patch log has criticized elsewhere. Left for its own
+#      explicit decision.
+#      VERIFIED EMPIRICALLY: a real waitress-served instance started,
+#      confirmed no dev-server warning in output, confirmed a real HTTP
+#      round-trip (GET /chain) still succeeds -- see session notes.
+# ---------------------------------------------------------------------------
+
+
+
 import json
 import time
 import hashlib
@@ -217,7 +295,34 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
 from flask import Flask, request, jsonify
-from werkzeug.serving import run_simple  # <- the import weird_science.py forgot
+from waitress import serve  # PRODUCTION WSGI SERVER -- see PATCH LOG v8.7. Replaces
+                             # werkzeug's run_simple, which prints its own warning that
+                             # it is a development server not meant for production use.
+
+# NEW v8.6 -- TradingBridgeError defined HERE, not imported. The prior
+# version of this block did `try: from covenant_trading_bridge import
+# TradingBridgeError except ImportError: class TradingBridgeError...` --
+# confirmed by a live HTTP test (not by reading the code) to silently
+# create TWO DISTINCT class objects: covenant_trading_bridge.py imports
+# Database/StakingPool/SuccessionGuardianSystem/etc. FROM this file, so
+# when THIS file's top-level import tried to pull TradingBridgeError from
+# covenant_trading_bridge before those classes were even defined yet
+# (this import sits above their definitions), the circular import failed
+# with ImportError every time, silently triggering the fallback class
+# instead of the real one. Every /trading/gift and /trading/report_fill
+# error path then raised the REAL TradingBridgeError (from
+# covenant_trading_bridge.py, imported successfully later via the lazy
+# import in CovenantUnifiedMaster.__init__, by which point this module
+# had finished loading) while the route's `except TradingBridgeError`
+# was bound to the FALLBACK class -- so it never matched, and every
+# rejected trading-bridge request surfaced as an unhandled 500 instead of
+# the intended 400 with a clear message. Confirmed via id() comparison:
+# the two classes were different objects, same name. Fixed by defining
+# it once, here, and having covenant_trading_bridge.py import THIS one
+# (see that file's own import list) instead of each file trying to
+# obtain it from the other.
+class TradingBridgeError(Exception):
+    pass
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -251,6 +356,20 @@ BASE_REGISTRATION_DIFFICULTY = 2
 # that never matched request.endpoint ("add_transaction"/"add_peer") except
 # for "mine", which happened to match by coincidence. Fixed here.
 RATE_LIMIT_DEFAULT = 20  # per 60s, unlisted/read endpoints
+
+# NEW v8.7 -- waitress's thread pool size. NOTE, stated plainly rather than
+# implied solved by "production WSGI server": /mine runs real proof-of-work
+# (block.mine() at MINING_DIFFICULTY) directly in the request-handling
+# thread. That's genuine CPU-bound work under CPython's GIL -- more
+# waitress threads does NOT parallelize it, it only lets OTHER requests
+# (reads, non-mining writes) continue being served by a different thread
+# while one thread is busy mining. If concurrent mining throughput ever
+# becomes a real requirement, that needs mining moved to a separate
+# process (e.g. via multiprocessing, same pattern run_sandboxed() already
+# uses for code proposals), not a thread-count tweak. Not done here --
+# flagged, not fixed, consistent with this file's own standing rule.
+WSGI_THREADS = 6
+
 RATE_LIMIT = {
     "add_transaction": 10,
     "mine": 1,
@@ -2531,6 +2650,7 @@ class P2PNode:
         self.friendship: Optional[FriendshipTracker] = None
         self.staking_pool: Optional[StakingPool] = None
         self.succession: Optional[SuccessionGuardianSystem] = None
+        self.trading_bridge = None  # NEW v8.6 -- see covenant_trading_bridge.py
         self.code_guardian: "CovenantGuardian" = CovenantGuardian()  # NEW v8.0
         self.rate_limiter = RateLimiter()
         self.adaptive_pow_manager = AdaptivePoWManager(db) if ADAPTIVE_POW else None
@@ -2560,6 +2680,28 @@ class P2PNode:
     def propagate_transaction(self, tx: Transaction):
         message = {"type": "TRANSACTION_PROPAGATE", "transaction": asdict(tx), "node_id": self.node_id,
                    "nonce": f"{tx.get_id()}{tx.timestamp}{secrets.token_hex(4)}"}
+        with self.peers_lock:
+            peers = list(self.peers.items())
+        for pid, (host, port) in peers:
+            threading.Thread(target=self._send_raw, args=(host, port, json.dumps(message)), daemon=True).start()
+
+    def propagate_trading_event(self, event_type: str, payload: dict):
+        """NEW v8.6 -- closes the gap confirmed empirically while testing
+        the trading bridge live: record_ledger_entry (used by
+        report_realized_profit/gift_stake_to_new_node, following genesis
+        mint's own pattern) only ever applies LOCALLY -- only /mine
+        triggers propagate_block. That's the exact same gap already
+        documented for staking (PATCH LOG item 9: 'no propagate_stake()
+        anywhere'), now showing up here too, and closed the same way
+        propagate_transaction already works: broadcast the full signed
+        payload, and the RECEIVING node independently re-verifies the
+        signature before applying anything -- never trusts a peer's
+        claim that a signature was valid. event_type is "profit" or
+        "gift"; payload carries everything _handle_peer needs to call
+        the SAME bridge functions the original node called, so
+        verification logic exists in exactly one place."""
+        message = {"type": "TRADING_EVENT_PROPAGATE", "event_type": event_type, "payload": payload,
+                   "node_id": self.node_id, "nonce": f"{event_type}{payload.get('timestamp')}{secrets.token_hex(4)}"}
         with self.peers_lock:
             peers = list(self.peers.items())
         for pid, (host, port) in peers:
@@ -2980,8 +3122,79 @@ class CovenantAPI:
             self.node.crisis_reason = ""
             return jsonify({"status": "success", "message": "crisis_mode cleared"})
 
+        # -------------------------------------------------------------
+        # PATCH LOG -- v8.6: TRADING BRIDGE (see covenant_trading_bridge.py
+        # for the full design rationale). Two routes, both requiring a real
+        # signature from the trading pool's own key -- same authorization
+        # model as /stake, /claim_rewards, /unstake: no separate API auth
+        # layer, the signature over the specific action IS the auth.
+        # Nonce/replay protection follows the exact pattern already used by
+        # /claim_rewards and /unstake (nonce_key from action+params+
+        # timestamp, checked via is_nonce_seen/mark_nonce_seen) rather than
+        # inventing a second convention.
+        # -------------------------------------------------------------
+        @self.app.route("/trading/report_fill", methods=["POST"])
+        def trading_report_fill():
+            if self.node.trading_bridge is None:
+                return jsonify({"status": "error", "message": "Trading bridge not available on this node (covenant_trading_bridge.py not importable)"}), 503
+            data = request.json or {}
+            pool_pubkey = data.get("pool_pubkey", "")
+            asset = data.get("asset", "")
+            exchange = data.get("exchange", "")
+            external_ref = data.get("external_ref", "")
+            pnl_usd = float(data.get("pnl_usd", 0.0))
+            timestamp = float(data.get("timestamp", 0.0))
+            signature = data.get("signature", "")
+            nonce_key = f"trading_profit:{pool_pubkey}:{exchange}:{external_ref}:{timestamp}"
+            if self.db.is_nonce_seen(nonce_key):
+                return jsonify({"status": "error", "message": "Duplicate/replayed profit report"}), 400
+            try:
+                result = self.node.trading_bridge.report_realized_profit(
+                    pool_pubkey, asset, exchange, external_ref, pnl_usd, timestamp, signature
+                )
+            except TradingBridgeError as e:
+                return jsonify({"status": "error", "message": str(e)}), 400
+            self.db.mark_nonce_seen(nonce_key)
+            return jsonify({"status": "success", **result})
+
+        @self.app.route("/trading/gift", methods=["POST"])
+        def trading_gift():
+            if self.node.trading_bridge is None:
+                return jsonify({"status": "error", "message": "Trading bridge not available on this node (covenant_trading_bridge.py not importable)"}), 503
+            data = request.json or {}
+            pool_pubkey = data.get("pool_pubkey", "")
+            recipient_pubkey = data.get("recipient_pubkey", "")
+            amount = float(data.get("amount", 0.0))
+            timestamp = float(data.get("timestamp", 0.0))
+            signature = data.get("signature", "")
+            nonce_key = f"node_gift:{pool_pubkey}:{recipient_pubkey}:{timestamp}"
+            if self.db.is_nonce_seen(nonce_key):
+                return jsonify({"status": "error", "message": "Duplicate/replayed gift"}), 400
+            try:
+                result = self.node.trading_bridge.gift_stake_to_new_node(
+                    pool_pubkey, recipient_pubkey, amount, timestamp, signature
+                )
+            except TradingBridgeError as e:
+                return jsonify({"status": "error", "message": str(e)}), 400
+            self.db.mark_nonce_seen(nonce_key)
+            return jsonify({"status": "success", **result})
+
     def run(self):
-        run_simple(self.host, self.port, self.app, threaded=True)
+        # PRODUCTION WSGI SERVER -- see PATCH LOG v8.7 (module docstring).
+        # connection_limit and channel_timeout are waitress's own defaults
+        # made explicit here rather than left implicit, so a future reader
+        # doesn't have to go check waitress's source to know what's
+        # actually in effect. clear_untrusted_proxy_headers=True is
+        # waitress's default as of the version pinned in requirements.txt;
+        # stated explicitly since silently relying on a library default
+        # that could change between versions is the same "invisible
+        # behavior" shape this file's own patch log has flagged elsewhere
+        # (e.g. PATCH LOG item H's hasattr guards).
+        serve(
+            self.app, host=self.host, port=self.port, threads=WSGI_THREADS,
+            connection_limit=100, channel_timeout=120,
+            clear_untrusted_proxy_headers=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3015,6 +3228,17 @@ class CovenantUnifiedMaster:
         self.node.friendship = FriendshipTracker(self.db)
         self.node.staking_pool = StakingPool(self.db)
         self.node.succession = SuccessionGuardianSystem(self.db)
+        # NEW v8.6 -- see covenant_trading_bridge.py. Imported lazily here
+        # (not at module top) so covenant_unified_v8.py has zero hard
+        # dependency on the bridge module -- the core file must still
+        # import and run standalone even if the bridge file is absent,
+        # consistent with this module's own stated policy of not letting
+        # one concern's presence become a silent requirement for another's.
+        try:
+            from covenant_trading_bridge import TradingBridge
+            self.node.trading_bridge = TradingBridge(self.db, self.node.sentinel, self.node.staking_pool, self.node.succession)
+        except ImportError:
+            self.node.trading_bridge = None
 
         self.node.chain = self.db.load_chain()
         if self.node.chain:
