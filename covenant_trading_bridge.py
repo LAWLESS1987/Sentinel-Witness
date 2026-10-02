@@ -1,64 +1,16 @@
-#!/usr/bin/env python3
-"""
-covenant_trading_bridge.py -- NEW. Connects the grid/bracket trading
-strategy (covenant/strategy/, ledger-app/) to Covenant's real ledger,
-ethics gate, and succession systems. Kept as a SEPARATE module rather
-than folded into covenant_unified_v8.py itself: that file's own internal
-organization already separates concerns into focused classes
-(StakingPool, SuccessionGuardianSystem, CovenantGuardian, ...) combined
-by CovenantUnifiedMaster -- trading-bridge logic is one more such
-concern, not core blockchain/governance machinery, and keeping it
-separate means covenant_unified_v8.py's already-long patch-log history
-doesn't have to absorb a domain that isn't its own. One small, clearly-
-delineated route is added to CovenantAPI (see the PATCH LOG v8.6 block
-in covenant_unified_v8.py) so this bridge is reachable over the same
-running API, not a second server to operate.
+"""Exchange-evidenced local ledger credits and signed gifts.
 
-WHY PROFIT, NOT EVERY FILL, IS WHAT GETS RECORDED: a BUY converts USD
-held at an exchange into an asset held at the same exchange -- it isn't
-new value entering the system, it's an external asset swap Covenant has
-no natural way to represent (the existing Transaction model moves
-EXISTING sender balance to a receiver; a buy has no Covenant-side
-"sender" with that balance, because the balance lives at Kraken/Coinbase/
-Crypto.com, not on this ledger). A completed round-trip SELL is
-different: run_grid_backtest's own fill discipline (grid_engine.py) only
-closes a position above its own cost basis, so a realized profit is a
-genuine new economic fact, structurally analogous to genesis's one-time
-mint -- not a transfer between two Covenant parties. Modeled that way
-here (record_ledger_entry with reason="trading_profit", gated by a real
-signature) rather than forced through the peer-to-peer Transaction/mining
-pipeline, which would need a fictional zero-balance "sender" and either
-fail its own balance check or require yet another hasattr-style special
-case -- exactly the fail-open shape this codebase's own patch log (items
-H, and generally) has spent several rounds closing elsewhere. Consistent
-with genesis's mint, but NOT unconditional the way genesis's one-time
-bootstrap mint is: every credit here requires a real signature from the
-pool's own key, verified before the ledger entry is written.
-
-WHY A GIFT IS A LEDGER CREDIT, NOT AN AUTO-STAKE: Covenant's own /stake
-route requires the STAKER's own signature (verify_stake_signature) --
-auto-staking on a new node's behalf using the POOL's authority would
-mean staking without the actual keyholder's consent, a real regression
-against a pattern this file enforces everywhere else. A gift here credits
-the recipient's spendable balance; if they want it staked, they submit
-their own signed /stake call, same as anyone else.
-
-SCOPE BOUNDARY, STATED PLAINLY: SuccessionGuardianSystem registration
-below covers who is authorized to sign FUTURE Covenant-ledger entries for
-the trading pool -- a software/cryptographic fact this code can actually
-enforce. It does NOT and cannot transfer control of the real exchange
-accounts (Coinbase/Kraken/Crypto.com) or the physical Ledger hardware
-wallet those accounts' keys ultimately depend on. That is real-world
-estate planning (a will, a secured note with recovery details, whatever
-the person's jurisdiction requires) outside what any code here can
-enforce. Do not let a clean succession registration on this side create
-the impression the whole operation's succession is handled -- it is one
-necessary piece, not the whole picture.
+Credits are local accounting entries, not exchange deposits or proof of reserves.
+Succession only concerns ledger authorization, not external account ownership.
 """
 
-import sys
 import time
-sys.path.insert(0, "/home/claude/covenant")
+import sqlite3
+import json
+import hashlib
+from contextlib import closing
+from decimal import Decimal
+from exchange_evidence import ConfiguredVerifier, EvidenceError, number, pool_fingerprint
 
 from covenant_unified_v8 import (
     _domain_frame, Database, StakingPool, SuccessionGuardianSystem,
@@ -121,90 +73,102 @@ class TradingBridge:
     """
 
     def __init__(self, db: Database, sentinel: ReasoningSentinel, staking_pool: StakingPool,
-                 succession: SuccessionGuardianSystem):
+                 succession: SuccessionGuardianSystem, verifier=None):
         self.db = db
         self.sentinel = sentinel
         self.staking_pool = staking_pool
         self.succession = succession
 
+        self.configuration_error = None
+        try:
+            self.verifier = verifier if verifier is not None else ConfiguredVerifier.from_environment()
+        except EvidenceError as exc:
+            self.verifier = ConfiguredVerifier()
+            self.configuration_error = str(exc)
+        with closing(sqlite3.connect(self.db.db_path)) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS trading_used_orders (exchange TEXT NOT NULL, order_id TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(exchange, order_id))")
+            conn.execute("CREATE TABLE IF NOT EXISTS trading_receipts (receipt TEXT PRIMARY KEY, evidence TEXT NOT NULL, timestamp REAL NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS trading_gifts (receipt TEXT PRIMARY KEY)")
+
+    @staticmethod
+    def _amount(value):
+        try:
+            amount = number(value, 'amount', positive=True)
+            if Decimal(str(float(amount))) != amount:
+                raise EvidenceError('Amount cannot be represented by this ledger')
+            return amount
+        except EvidenceError as exc:
+            raise TradingBridgeError(str(exc)) from None
+
     def report_realized_profit(self, pool_pubkey_pem: str, asset: str, exchange: str, external_ref: str,
                                 pnl_usd: float, timestamp: float, signature_b64: str) -> dict:
-        """
-        Credits `pnl_usd` to the trading pool's Covenant balance, gated
-        by a real signature over (pool_pubkey, asset, exchange,
-        external_ref, pnl_usd, timestamp) -- see module docstring for why
-        this is a signed mint-style credit, not a peer-to-peer
-        Transaction. `external_ref` (e.g. an exchange order id) plus
-        timestamp double as replay protection via the caller's own
-        nonce-seen table, same pattern as every other signed action in
-        this codebase (see /claim_rewards, /unstake) -- enforced at the
-        API route (see PATCH LOG v8.6 in covenant_unified_v8.py), not
-        re-implemented here, so there's one nonce-checking pattern in the
-        system, not two slightly-different ones.
-        """
-        if pnl_usd <= 0:
-            raise TradingBridgeError(
-                f"report_realized_profit called with pnl_usd={pnl_usd} <= 0 -- this bridge only "
-                f"records REALIZED PROFIT (see module docstring); a non-positive value means either "
-                f"a losing trade (which this strategy's take-profit gating should make structurally "
-                f"impossible for a CLOSED trade -- see grid_engine.py's own note on this) or a caller "
-                f"bug. Refusing rather than writing a nonsensical ledger entry."
-            )
+        """Authenticate, independently calculate profit, and atomically consume orders."""
+        claimed = self._amount(pnl_usd)
+        self._amount(timestamp)
         if not verify_trading_profit_signature(pool_pubkey_pem, asset, exchange, external_ref,
-                                                 pnl_usd, timestamp, signature_b64):
-            raise TradingBridgeError("Invalid trading-profit signature -- refusing to credit the ledger.")
-
-        # Audit-trail judgment, NOT a hard gate -- see module docstring on
-        # why this is soft here specifically. A profit report has no
-        # peer-to-peer "sender" content to judge for the kind of thing
-        # MockJudge's keyword scan is even meant to catch; logging the
-        # judgment keeps the same audit pattern the rest of the system
-        # uses without pretending a hard gate here would mean something
-        # it doesn't.
-        judgment = self.sentinel.judge.evaluate(
-            {"origin": "trading_bracket_grid", "asset": asset, "exchange": exchange,
-             "external_ref": external_ref, "pnl_usd": pnl_usd},
-            self.sentinel.principles,
-        )
-        ref_id = f"trading_profit:{exchange}:{external_ref}"
-        self.db.save_judgment(ref_id, judgment)
-        self.db.record_ledger_entry(pool_pubkey_pem, pnl_usd, "trading_profit", ref_id=ref_id)
-
-        return {
-            "credited": pnl_usd, "new_balance": self.db.get_balance(pool_pubkey_pem),
-            "judgment": judgment.reasoning, "ref_id": ref_id,
-        }
+                                               pnl_usd, timestamp, signature_b64):
+            raise TradingBridgeError('Invalid trading-profit signature')
+        try:
+            if self.configuration_error:
+                raise EvidenceError(self.configuration_error)
+            evidence = self.verifier.verify(pool_pubkey_pem, asset, exchange, external_ref)
+            if claimed != evidence.pnl:
+                raise EvidenceError('Reported profit does not equal exchange proceeds minus cost and fees')
+        except EvidenceError as exc:
+            raise TradingBridgeError(str(exc)) from None
+        record = json.dumps(evidence.record(), sort_keys=True, separators=(',', ':'))
+        ref_id = 'trading_profit:' + hashlib.sha256(record.encode()).hexdigest()
+        judgment = self.sentinel.judge.evaluate(evidence.record(), self.sentinel.principles)
+        try:
+            with closing(sqlite3.connect(self.db.db_path, timeout=30)) as conn, conn:
+                conn.execute('BEGIN IMMEDIATE')
+                # Older bridge credits had no authenticated order receipt. Never
+                # silently re-credit the same legacy external reference.
+                legacy_refs = [f'trading_profit:{exchange}:{ref}' for ref in
+                               (external_ref, evidence.buy.order_id, evidence.sell.order_id)]
+                if conn.execute('SELECT 1 FROM ledger_entries WHERE reason=? AND ref_id IN (?,?,?)',
+                                ('trading_profit', *legacy_refs)).fetchone():
+                    raise TradingBridgeError('This report already has a legacy ledger credit')
+                conn.execute('INSERT INTO trading_receipts VALUES (?,?,?)', (ref_id, record, time.time()))
+                for order in (evidence.buy, evidence.sell):
+                    conn.execute('INSERT INTO trading_used_orders VALUES (?,?,?)', (exchange, order.order_id, ref_id))
+                conn.execute('INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp) VALUES (?,?,?,?,?,?)',
+                             (ref_id, int(judgment.violates), judgment.reasoning, judgment.principle_violated, judgment.judge_id, time.time()))
+                conn.execute('INSERT INTO ledger_entries (pubkey,delta,reason,ref_id,timestamp) VALUES (?,?,?,?,?)',
+                             (pool_pubkey_pem, float(claimed), 'trading_profit', ref_id, time.time()))
+                balance = conn.execute('SELECT COALESCE(SUM(delta),0) FROM ledger_entries WHERE pubkey=?', (pool_pubkey_pem,)).fetchone()[0]
+        except sqlite3.IntegrityError:
+            raise TradingBridgeError('Order already credited or ledger constraint rejected the report') from None
+        return {'credited': float(claimed), 'new_balance': balance, 'judgment': judgment.reasoning, 'ref_id': ref_id}
 
     def gift_stake_to_new_node(self, pool_pubkey_pem: str, recipient_pubkey_pem: str, amount: float,
                                 timestamp: float, signature_b64: str) -> dict:
-        """
-        Non-usurious by construction: a straight ledger credit, zero
-        consideration, no interest, no repayment obligation -- reason
-        string is "node_gift", deliberately distinct from "stake_lock"
-        or anything loan-shaped. Requires the POOL's real signature
-        (proving the operator authorized this specific gift, to this
-        specific recipient, for this specific amount) -- an attacker who
-        merely knows a recipient pubkey cannot drain the pool by calling
-        this. Does NOT stake on the recipient's behalf -- see module
-        docstring; they stake it themselves via the existing signed
-        /stake route if they choose to.
-        """
-        if amount <= 0:
-            raise TradingBridgeError("Gift amount must be positive.")
+        """Move a signed gift in one transaction, with permanent replay protection."""
+        value = float(self._amount(amount))
+        self._amount(timestamp)
+        try:
+            pool_fingerprint(recipient_pubkey_pem)
+        except EvidenceError as exc:
+            raise TradingBridgeError(str(exc)) from None
         if not verify_node_gift_signature(pool_pubkey_pem, recipient_pubkey_pem, amount, timestamp, signature_b64):
-            raise TradingBridgeError("Invalid node-gift signature -- refusing to move funds.")
-        balance = self.db.get_balance(pool_pubkey_pem)
-        if balance < amount:
-            raise TradingBridgeError(f"Insufficient pool balance: have {balance:.2f}, need {amount:.2f}.")
-
-        ref_id = f"node_gift:{pool_pubkey_pem[:16]}:{recipient_pubkey_pem[:16]}:{timestamp}"
-        self.db.record_ledger_entry(pool_pubkey_pem, -amount, "node_gift_sent", ref_id=ref_id)
-        self.db.record_ledger_entry(recipient_pubkey_pem, amount, "node_gift_received", ref_id=ref_id)
-
-        return {
-            "gifted": amount, "pool_balance_after": self.db.get_balance(pool_pubkey_pem),
-            "recipient_balance_after": self.db.get_balance(recipient_pubkey_pem), "ref_id": ref_id,
-        }
+            raise TradingBridgeError('Invalid node-gift signature')
+        ref_id = 'node_gift:' + hashlib.sha256(node_gift_payload(pool_pubkey_pem, recipient_pubkey_pem, amount, timestamp)).hexdigest()
+        try:
+            with closing(sqlite3.connect(self.db.db_path, timeout=30)) as conn, conn:
+                conn.execute('BEGIN IMMEDIATE')
+                legacy_ref = f'node_gift:{pool_pubkey_pem[:16]}:{recipient_pubkey_pem[:16]}:{timestamp}'
+                if conn.execute('SELECT 1 FROM ledger_entries WHERE reason=? AND ref_id=?', ('node_gift_sent', legacy_ref)).fetchone():
+                    raise TradingBridgeError('This gift already has a legacy ledger entry')
+                conn.execute('INSERT INTO trading_gifts VALUES (?)', (ref_id,))
+                balance = conn.execute('SELECT COALESCE(SUM(delta),0) FROM ledger_entries WHERE pubkey=?', (pool_pubkey_pem,)).fetchone()[0]
+                if balance < value:
+                    raise TradingBridgeError('Insufficient pool balance')
+                for pubkey, delta, reason in ((pool_pubkey_pem, -value, 'node_gift_sent'), (recipient_pubkey_pem, value, 'node_gift_received')):
+                    conn.execute('INSERT INTO ledger_entries (pubkey,delta,reason,ref_id,timestamp) VALUES (?,?,?,?,?)', (pubkey, delta, reason, ref_id, time.time()))
+                balances = [conn.execute('SELECT COALESCE(SUM(delta),0) FROM ledger_entries WHERE pubkey=?', (key,)).fetchone()[0] for key in (pool_pubkey_pem, recipient_pubkey_pem)]
+        except sqlite3.IntegrityError:
+            raise TradingBridgeError('Gift already processed or ledger constraint rejected the gift') from None
+        return {'gifted': value, 'pool_balance_after': balances[0], 'recipient_balance_after': balances[1], 'ref_id': ref_id}
 
     def register_pool_succession(self, pool_pubkey_pem: str, successor_pubkey_pem: str,
                                   guardian_pubkeys: list, threshold: int,
