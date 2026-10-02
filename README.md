@@ -17,6 +17,8 @@ commit `3f9464a890ea6ea097e933c42b48a2f058925100` on 2026-10-01.
 | `AutomatedSetupModal.jsx` | Form for per-trade and daily-count limits |
 | `automatedLimits.js`, `tierNavigation.js` | Frontend validation and tier-navigation helpers |
 | `requirements.txt` | Python dependencies |
+| `ethics_policy.py`, `tests/` | Ledger-effect admission policy and ethics regressions |
+| `requirements-dev.txt` | Development/test dependencies |
 
 ## What the trading bridge establishes
 
@@ -37,6 +39,16 @@ are local accounting entries, not exchange deposits or proof of reserves.
 Succession concerns authorization within this ledger. It does not transfer
 exchange accounts or a hardware wallet. The default node constructs mock
 judges; their results are not evidence of semantic safety.
+
+## Ethics admission and recovery
+
+The gate now enforces refusals on the tested value paths, records warnings and
+halts, and requires a configured operator token to clear crisis mode. Honest
+gifts and permitted staking/reward/exit actions remain available. Signed scores
+are preserved; judge estimates affect local queue priority without invalidating
+signatures. See the [current ethics verification checklist](docs/ethics-gate-verification-checklist.md)
+for operator configuration, 64 offline cases, and the remaining evidence limits.
+The original Claude checklist remains available as a dated historical record.
 
 ## Local inspection
 

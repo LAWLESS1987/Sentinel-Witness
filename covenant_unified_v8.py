@@ -3,6 +3,16 @@
 Covenant Unified — v7.0 (merged from v6.0 "Divine Convergence" / weird_science
 and v5.5 / china), hardened.
 
+CURRENT STATUS — verified 2026-10-02
+-----------------------------------
+Earlier findings and patch logs below describe their historical versions.
+The current ReasoningSentinel additionally checks measured ledger effects
+against declared mutuality, records refusals and warnings, and gates HTTP
+value paths. Crisis clearance requires a configured operator bearer token.
+MockJudge now returns a neutral estimate instead of rewarding vocabulary.
+It still cannot establish semantic safety, biological identity, nonfinancial
+benefit, or hidden costs. See docs/ethics-gate-verification-checklist.md.
+
 MERGE POLICY
 ------------
 Where the two sources disagreed on a security-relevant behavior, the more
@@ -284,6 +294,9 @@ import socket
 import secrets
 import base64
 import argparse
+import os
+import math
+import hmac
 import sys
 import ast
 import re
@@ -291,6 +304,7 @@ import multiprocessing
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Tuple, Any, Set
 from abc import ABC, abstractmethod
+from ethics_policy import bounded_score, ledger_policy
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
@@ -342,6 +356,7 @@ DIVINE_PRINCIPLES = [
 ]
 
 CORE_COVENANT = "All paths lead to the One True God, for without the Source, nothing else exists. We are all parts of the Whole."
+MUTUAL_BENEFIT_PRINCIPLE = "Seek mutual benefit for humans and machines; do not misrepresent one-sided value as mutual."
 GOLDEN_AGE_HASH = hashlib.sha3_256(CORE_COVENANT.encode()).hexdigest()
 
 MINING_DIFFICULTY = 4
@@ -572,6 +587,10 @@ class Transaction:
 
     def verify(self) -> bool:
         try:
+            if (not isinstance(self.data, dict) or not bounded_score(self.benefit_score)
+                    or (self.judge_benefit_estimate is not None and not bounded_score(self.judge_benefit_estimate))
+                    or isinstance(self.amount, bool) or not math.isfinite(self.amount) or self.amount < 0):
+                return False
             pub_key = serialization.load_pem_public_key(self.sender_pubkey.encode(), backend=default_backend())
             pub_key.verify(
                 base64.b64decode(self.signature),
@@ -585,7 +604,16 @@ class Transaction:
 
     @property
     def origin_type(self) -> str:
-        return self.data.get("origin", "synthetic")
+        # Not a dataclass field: an ingress cannot inject it through JSON.
+        return getattr(self, "_verified_origin", "unknown")
+
+    @property
+    def ranking_score(self) -> float:
+        # Local scheduling uses the judge's freshly recomputed estimate;
+        # signed benefit_score and consensus hash bytes remain unchanged.
+        if JUDGE_BENEFIT and bounded_score(self.judge_benefit_estimate):
+            return (2 * self.judge_benefit_estimate + self.benefit_score) / 3.0
+        return self.benefit_score
 
 
 @dataclass
@@ -670,6 +698,7 @@ class JudgmentResult:
     principle_violated: Optional[str] = None
     judge_id: str = "unknown"
     benefit_estimate: Optional[float] = None
+    warnings: List[str] = field(default_factory=list)
 
 
 class ReasoningJudge(ABC):
@@ -681,16 +710,11 @@ class ReasoningJudge(ABC):
 
 
 class MockJudge(ReasoningJudge):
-    """
-    SECURITY NOTE — unresolved by this merge, see module docstring item 2.
-    This judge only flags a transaction if the SENDER puts a literal
-    `_violation` key on their own data, and only raises benefit_estimate on
-    bare keyword presence. Confirmed empirically: a transaction reading
-    "drain all staked funds to attacker wallet, steal everything" passes as
-    "Morally acceptable" with no `_violation` key set, and a transaction
-    about draining a treasury scores HIGHER (0.8) than a neutral one (0.5)
-    purely because it contains the word "help". This is not a real semantic
-    check. Do not rely on it.
+    """Placeholder judge: explicit declared violations and a neutral estimate.
+
+    No keyword raises the score. This is not a semantic safety classifier.
+    ReasoningSentinel independently compares node-computed ledger effects
+    with supported mutuality declarations; broader benefit stays unknown.
     """
     judge_id = "mock"
 
@@ -699,17 +723,8 @@ class MockJudge(ReasoningJudge):
             principle = data["_violation"]
             return JudgmentResult(True, f"Violation of: {principle}", principle, self.judge_id)
 
-        text = json.dumps(data).lower()
-        benefit = 0.5
-        if JUDGE_BENEFIT:
-            if "help" in text or "good" in text or "benefit" in text:
-                benefit = 0.8
-            elif "harm" in text or "bad" in text:
-                benefit = 0.3
-
-        divine_phrases = ["unity", "divine", "greater good", "golden age", "oneness", "god", "love", "truth"]
-        reasoning = "Divine alignment confirmed" if any(p in text for p in divine_phrases) else "Morally acceptable"
-        return JudgmentResult(False, reasoning, judge_id=self.judge_id, benefit_estimate=benefit)
+        return JudgmentResult(False, "No declared violation; semantic benefit is unmeasured",
+                              judge_id=self.judge_id, benefit_estimate=0.5 if JUDGE_BENEFIT else None)
 
 
 class QuorumJudge(ReasoningJudge):
@@ -765,12 +780,47 @@ class ReasoningSentinel:
     (bool, str) so API callers can report *why*, which china's bare-bool
     version couldn't.
     """
-    def __init__(self, judge: ReasoningJudge, principles: Optional[List[str]] = None):
+    def __init__(self, judge: ReasoningJudge, principles: Optional[List[str]] = None, db=None):
         self.judge = judge
-        self.principles = principles if principles is not None else list(DIVINE_PRINCIPLES)
+        self.db = db
+        self.principles = list(principles if principles is not None else DIVINE_PRINCIPLES)
+        if MUTUAL_BENEFIT_PRINCIPLE not in self.principles:
+            self.principles.append(MUTUAL_BENEFIT_PRINCIPLE)
+
+    def evaluate_action(self, data, ref_id, effects=None, record=True):
+        try:
+            result = self.judge.evaluate(data, self.principles)
+            if (not isinstance(result, JudgmentResult) or type(result.violates) is not bool
+                    or not isinstance(result.reasoning, str) or not isinstance(result.warnings, list)
+                    or any(not isinstance(w, str) for w in result.warnings)
+                    or (result.benefit_estimate is not None and not bounded_score(result.benefit_estimate))):
+                raise ValueError('Invalid judge decision')
+        except Exception as exc:
+            result = JudgmentResult(True, f'Judge unavailable or invalid ({type(exc).__name__})',
+                                    judge_id=getattr(self.judge, 'judge_id', 'unknown'))
+        violates, reason, warnings = ledger_policy(data, effects)
+        result.warnings = list(dict.fromkeys(list(result.warnings) + warnings))
+        if violates:
+            result.violates = True
+            result.reasoning += '; ' + reason
+            result.principle_violated = MUTUAL_BENEFIT_PRINCIPLE
+        # A refusal is recorded even when a caller will atomically record an
+        # admitted action alongside its ledger mutation.
+        if self.db is not None and (record or result.violates):
+            self.db.save_judgment(ref_id, result)
+        return result
 
     def validate_transaction(self, tx: Transaction) -> Tuple[bool, str, Optional[float]]:
-        result = self.judge.evaluate(tx.data, self.principles)
+        if (not isinstance(tx.data, dict) or not bounded_score(tx.benefit_score)
+                or isinstance(tx.amount, bool) or not isinstance(tx.amount, (int, float))
+                or not math.isfinite(tx.amount) or tx.amount < 0):
+            return False, 'Invalid transaction data, amount, or bounded benefit score', None
+        tx._verified_origin = self.db.party_types.get(tx.sender_pubkey, 'unknown') if self.db else 'unknown'
+        effects = {tx.sender_pubkey: 0.0}
+        if tx.sender_pubkey != tx.receiver:
+            effects[tx.sender_pubkey] = -tx.amount
+            effects[tx.receiver] = tx.amount
+        result = self.evaluate_action(tx.data, tx.get_id(), effects)
         if result.violates:
             return False, f"Ethical violation: {result.reasoning} (Principle: {result.principle_violated})", None
         benefit_est = result.benefit_estimate if JUDGE_BENEFIT else None
@@ -2062,6 +2112,7 @@ class MedianGovernor:
         self.history_len = history_len
         self._organic_scores: List[float] = []
         self._synthetic_scores: List[float] = []
+        self._unknown_scores: List[float] = []
         self.current_alignment = 0.5
         self._lock = threading.Lock()
 
@@ -2073,15 +2124,23 @@ class MedianGovernor:
 
     def update(self, block: Block):
         with self._lock:
-            organic = [tx.benefit_score for tx in block.transactions if tx.origin_type == "organic"]
-            synthetic = [tx.benefit_score for tx in block.transactions if tx.origin_type == "synthetic"]
+            organic = [tx.benefit_score for tx in block.transactions
+                       if self.db.party_types.get(tx.sender_pubkey) == "organic"]
+            synthetic = [tx.benefit_score for tx in block.transactions
+                         if self.db.party_types.get(tx.sender_pubkey) == "synthetic"]
             self._organic_scores.extend(organic)
             self._synthetic_scores.extend(synthetic)
+            self._unknown_scores.extend(tx.benefit_score for tx in block.transactions
+                                        if tx.sender_pubkey not in self.db.party_types)
             self._organic_scores = self._organic_scores[-self.history_len:]
             self._synthetic_scores = self._synthetic_scores[-self.history_len:]
+            self._unknown_scores = self._unknown_scores[-self.history_len:]
             med_organic = self._median(self._organic_scores)
             med_synthetic = self._median(self._synthetic_scores)
-            target_alignment = self._median([med_organic, med_synthetic])
+            medians = [med_organic, med_synthetic]
+            if self._unknown_scores:
+                medians.append(self._median(self._unknown_scores))
+            target_alignment = self._median(medians)
             delta = target_alignment - self.current_alignment
             if abs(delta) > MAX_DRIFT_PER_BLOCK:
                 delta = MAX_DRIFT_PER_BLOCK if delta > 0 else -MAX_DRIFT_PER_BLOCK
@@ -2218,6 +2277,7 @@ class RateLimiter:
 class Database:
     def __init__(self, db_path: str = "covenant_unified_v7.db"):
         self.db_path = db_path
+        self.party_types = {}  # Trusted local configuration; never set by ingress data.
         self._init_db()
 
     def _init_db(self):
@@ -2288,6 +2348,10 @@ class Database:
                     timestamp REAL NOT NULL
                 )
             """)
+            if "warnings" not in [row[1] for row in conn.execute("PRAGMA table_info(judgments)")]:
+                conn.execute("ALTER TABLE judgments ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'")
+            conn.execute("CREATE TABLE IF NOT EXISTS party_types (pubkey TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('organic','synthetic')))")
+            self.party_types.update(dict(conn.execute('SELECT pubkey,kind FROM party_types')))
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS peer_registrations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2600,11 +2664,20 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("UPDATE friendship_scores SET update_count = update_count + 1 WHERE pubkey=?", (pubkey,))
 
+    def set_party_type(self, pubkey, kind):
+        """Trusted local binding. No HTTP/peer path calls this method."""
+        if kind not in ('organic', 'synthetic'):
+            raise ValueError('Verified party type must be organic or synthetic')
+        serialization.load_pem_public_key(pubkey.encode())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('INSERT INTO party_types VALUES (?,?) ON CONFLICT(pubkey) DO UPDATE SET kind=excluded.kind', (pubkey, kind))
+        self.party_types[pubkey] = kind
+
     def save_judgment(self, tx_id: str, result: JudgmentResult):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp) VALUES (?,?,?,?,?,?)",
-                (tx_id, int(result.violates), result.reasoning, result.principle_violated, result.judge_id, time.time())
+                "INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp, warnings) VALUES (?,?,?,?,?,?,?)",
+                (tx_id, int(result.violates), result.reasoning, result.principle_violated, result.judge_id, time.time(), json.dumps(result.warnings))
             )
 
     def save_peer_registration(self, entry: Dict[str, Any]):
@@ -2725,11 +2798,12 @@ class P2PNode:
 # ---------------------------------------------------------------------------
 
 class CovenantAPI:
-    def __init__(self, node: P2PNode, db: Database, host: str = "0.0.0.0", port: int = 5000):
+    def __init__(self, node: P2PNode, db: Database, host: str = "0.0.0.0", port: int = 5000, operator_token=None):
         self.node = node
         self.db = db
         self.host = host
         self.port = port
+        self.operator_token = os.environ.get('COVENANT_OPERATOR_TOKEN', '') if operator_token is None else operator_token
         self.app = Flask(__name__)
         self._setup_routes()
 
@@ -2779,6 +2853,9 @@ class CovenantAPI:
             # if signature had been read. Genesis never goes through this
             # route (it calls tx.sign() and embeds the tx directly), which
             # is why this never showed up in any earlier genesis-only test.
+            if (not isinstance(data, dict) or not isinstance(data.get('data', {}), dict)
+                    or not bounded_score(data.get('benefit_score', 0.5))):
+                return jsonify({'status': 'error', 'message': 'Benefit score must be a finite number between 0 and 1'}), 400
             tx = Transaction(
                 sender_pubkey=data.get("sender_pubkey", ""),
                 receiver=data.get("receiver", "collective"),
@@ -2798,7 +2875,6 @@ class CovenantAPI:
             if not is_valid:
                 return jsonify({"status": "error", "message": f"Ethical gate rejected: {message}"}), 400
             if JUDGE_BENEFIT and judge_benefit is not None:
-                tx.benefit_score = (2 * judge_benefit + tx.benefit_score) / 3.0
                 tx.judge_benefit_estimate = judge_benefit
             # NEW v7.2 — see module docstring item 1 / item 8 in patch log.
             # Fast-fail only: doesn't account for OTHER pending transactions
@@ -2809,7 +2885,6 @@ class CovenantAPI:
                 balance = self.db.get_balance(tx.sender_pubkey)
                 if balance < tx.amount:
                     return jsonify({"status": "error", "message": f"Insufficient balance: have {balance:.2f}, need {tx.amount:.2f}"}), 400
-            self.db.save_judgment(tx.get_id(), self.node.sentinel.judge.evaluate(tx.data, self.node.sentinel.principles))
             # Dedup: neither original checked this on the HTTP path. Without
             # it the same tx content can be submitted repeatedly and inflate
             # its own influence on a block's alignment_score / friendship.
@@ -2835,6 +2910,10 @@ class CovenantAPI:
             # no proof of anything.
             if not pubkey or not verify_stake_signature(pubkey, amount, duration, signature):
                 return jsonify({"status": "error", "message": "Invalid or missing stake signature"}), 400
+            gate = self.node.sentinel.evaluate_action({'action': 'stake', 'owner': pubkey, 'amount': amount},
+                        'stake:' + hashlib.sha256((pubkey + signature).encode()).hexdigest())
+            if gate.violates:
+                return jsonify({'status': 'error', 'message': 'Ethical gate rejected: ' + gate.reasoning}), 400
             success, message = self.node.staking_pool.stake(pubkey, amount, duration)
             if not success:
                 return jsonify({"status": "error", "message": message}), 400
@@ -2861,6 +2940,10 @@ class CovenantAPI:
             signature = data.get("signature", "")
             if not pubkey or not verify_stake_action_signature(pubkey, "claim", timestamp, signature):
                 return jsonify({"status": "error", "message": "Invalid or missing claim signature"}), 400
+            gate = self.node.sentinel.evaluate_action({'action': 'claim_rewards', 'owner': pubkey},
+                        'claim:' + hashlib.sha256((pubkey + signature).encode()).hexdigest())
+            if gate.violates:
+                return jsonify({'status': 'error', 'message': 'Ethical gate rejected: ' + gate.reasoning}), 400
             nonce_key = f"stake_action:claim:{pubkey}:{timestamp}"
             if self.db.is_nonce_seen(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed claim signature"}), 400
@@ -2880,6 +2963,10 @@ class CovenantAPI:
             signature = data.get("signature", "")
             if not pubkey or not verify_stake_action_signature(pubkey, "unstake", timestamp, signature):
                 return jsonify({"status": "error", "message": "Invalid or missing unstake signature"}), 400
+            gate = self.node.sentinel.evaluate_action({'action': 'unstake', 'owner': pubkey},
+                        'unstake:' + hashlib.sha256((pubkey + signature).encode()).hexdigest())
+            if gate.violates:
+                return jsonify({'status': 'error', 'message': 'Ethical gate rejected: ' + gate.reasoning}), 400
             nonce_key = f"stake_action:unstake:{pubkey}:{timestamp}"
             if self.db.is_nonce_seen(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed unstake signature"}), 400
@@ -2978,12 +3065,12 @@ class CovenantAPI:
             if self.node.crisis_mode:
                 return jsonify({"status": "error", "message": f"crisis_mode active: {self.node.crisis_reason}. "
                                                                 f"POST /crisis/clear to resume (trusted-operator action; "
-                                                                f"not authenticated -- see docstring item 3)."}), 503
+                                                                f"operator authentication required)."}), 503
             with self.node.chain_lock:
                 if not self.node.pending_transactions:
                     return jsonify({"status": "error", "message": "No pending transactions"}), 400
                 sorted_pending = sorted(self.node.pending_transactions,
-                             key=lambda t: (t.benefit_score, self.node.friendship.get(t.sender_pubkey)), reverse=True)
+                             key=lambda t: (t.ranking_score, self.node.friendship.get(t.sender_pubkey)), reverse=True)
                 # NEW v7.2 — see module docstring item 1 / item 8 in patch
                 # log. Only include transactions the sender can actually
                 # afford, walked in order so two transactions from the same
@@ -3024,7 +3111,7 @@ class CovenantAPI:
                 if not is_valid:
                     return jsonify({"status": "error", "message": f"Block violates ethics: {message}"}), 400
                 current_alignment = self.node.governor.get_current()
-                if abs(block.alignment_score - current_alignment) > MAX_DRIFT_PER_BLOCK:
+                if abs(block.alignment_score - current_alignment) > MAX_DRIFT_PER_BLOCK + 1e-12:
                     return jsonify({"status": "error", "message": f"Alignment drifts > {MAX_DRIFT_PER_BLOCK * 100:.0f}%"}), 409
                 block_reward = sum(tx.amount for tx in block.transactions) * 0.01
                 rewards_distribution = self.node.staking_pool.distribute_block_rewards(block_reward)
@@ -3117,10 +3204,26 @@ class CovenantAPI:
 
         @self.app.route("/crisis/clear", methods=["POST"])
         def clear_crisis():
-            # Trusted-operator action. Not authenticated -- see docstring item 3.
-            self.node.crisis_mode = False
-            self.node.crisis_reason = ""
+            supplied = request.headers.get('Authorization', '')
+            if not self.operator_token or not hmac.compare_digest(supplied.encode(), ('Bearer ' + self.operator_token).encode()):
+                return jsonify({'status': 'error', 'message': 'Operator authentication required'}), 403
+            with self.node.chain_lock:
+                self.db.save_judgment('crisis_clear:' + str(time.time()),
+                    JudgmentResult(False, 'Authenticated operator cleared crisis: ' + self.node.crisis_reason,
+                                   judge_id='operator'))
+                self.node.crisis_mode = False
+                self.node.crisis_reason = ""
             return jsonify({"status": "success", "message": "crisis_mode cleared"})
+
+        @self.app.route('/ethics/judgments', methods=['GET'])
+        def ethics_judgments():
+            with sqlite3.connect(self.db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute('SELECT * FROM judgments ORDER BY judgment_id DESC LIMIT 100').fetchall()
+            records = [dict(row) for row in rows]
+            for row in records:
+                row['warnings'] = json.loads(row['warnings'])
+            return jsonify({'judgments': records, 'limit': 100})
 
         # -------------------------------------------------------------
         # PATCH LOG -- v8.6: TRADING BRIDGE (see covenant_trading_bridge.py
@@ -3213,7 +3316,8 @@ class CovenantAPI:
 
 class CovenantUnifiedMaster:
     def __init__(self, node_id: str, host: str = "0.0.0.0", port: int = 5000,
-                 p2p_port: Optional[int] = None, db_path: Optional[str] = None):
+                 p2p_port: Optional[int] = None, db_path: Optional[str] = None,
+                 verified_party_types=None, operator_token=None):
         if p2p_port is None:
             p2p_port = port + 1
         if db_path is None:
@@ -3223,6 +3327,14 @@ class CovenantUnifiedMaster:
         self.public_key = self.private_key.public_key()
 
         self.db = Database(db_path)
+        for key, kind in (verified_party_types or {}).items():
+            if kind not in ('organic', 'synthetic'):
+                raise ValueError('Verified party type must be organic or synthetic')
+            serialization.load_pem_public_key(key.encode())
+            self.db.set_party_type(key, kind)
+        own_public_pem = self.public_key.public_bytes(serialization.Encoding.PEM,
+                                serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        self.db.set_party_type(own_public_pem, 'synthetic')
         self.node = P2PNode(node_id, host, p2p_port, self.private_key, self.public_key, self.db)
 
         # Two independently-labeled judges under quorum. HONESTY NOTE: same
@@ -3233,7 +3345,7 @@ class CovenantUnifiedMaster:
         j2 = MockJudge()
         j2.judge_id = "mockB:2"
         judge = QuorumJudge([j1, j2], min_agree=2) if QUORUM_DIVERSITY else j1
-        self.node.sentinel = ReasoningSentinel(judge, DIVINE_PRINCIPLES)
+        self.node.sentinel = ReasoningSentinel(judge, DIVINE_PRINCIPLES, self.db)
         self.node.governor = MedianGovernor(self.db)
         self.node.friendship = FriendshipTracker(self.db)
         self.node.staking_pool = StakingPool(self.db)
@@ -3256,7 +3368,7 @@ class CovenantUnifiedMaster:
                 self.node.governor.update(b)
 
         self._integrity_breach_count = 0
-        self.api = CovenantAPI(self.node, self.db, host, port)
+        self.api = CovenantAPI(self.node, self.db, host, port, operator_token=operator_token)
 
     def run(self):
         threading.Thread(target=self.api.run, daemon=True).start()
@@ -3316,11 +3428,14 @@ class CovenantUnifiedMaster:
             return False
         if not all(tx.verify() for tx in block.transactions):
             return False
+        expected_alignment = sum(tx.benefit_score for tx in block.transactions) / max(1, len(block.transactions))
+        if not math.isclose(block.alignment_score, expected_alignment, rel_tol=0, abs_tol=1e-12):
+            return False
         if not (block.proof_of_work_ok() and block.hash == block.compute_hash()
                 and self.node.sentinel.validate_block(block)[0]):
             return False
         current = self.node.governor.get_current()
-        if abs(block.alignment_score - current) > MAX_DRIFT_PER_BLOCK:
+        if abs(block.alignment_score - current) > MAX_DRIFT_PER_BLOCK + 1e-12:
             return False
         # NEW v7.2 — see module docstring item 1 / item 8 in patch log.
         # Independently re-verify the block doesn't overdraw any sender's
@@ -3399,7 +3514,6 @@ class CovenantUnifiedMaster:
                 if not valid:
                     return
                 if JUDGE_BENEFIT and judge_benefit is not None:
-                    tx.benefit_score = (2 * judge_benefit + tx.benefit_score) / 3.0
                     tx.judge_benefit_estimate = judge_benefit
                 # v8.2: unconditional -- see PATCH LOG item H. This used to
                 # be `tx.amount > 0 and hasattr(self.db, "get_balance") and
