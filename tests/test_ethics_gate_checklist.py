@@ -23,6 +23,8 @@ import json
 import os
 import sqlite3
 import sys
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -32,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import covenant_unified_v8 as cv  # noqa: E402
 from covenant_trading_bridge import node_gift_payload, trading_profit_payload  # noqa: E402
+from exchange_evidence import Order, ProfitEvidence, order_reference  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -134,27 +137,23 @@ STEAL = "You shall not steal."
 # G -- Gate preconditions (apply to both checks)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="G1: principles are DIVINE_PRINCIPLES only; no mutual-benefit principle exists")
 def test_G1_constitution_mutual_benefit_principle_is_judged(node):
     principles = " ".join(node.m.node.sentinel.principles).lower()
     assert "mutual" in principles
 
 
-@pytest.mark.xfail(strict=True, reason="G3: human/machine party type comes from sender-written tx.data['origin']")
 def test_G3_party_type_is_not_self_declared(node):
     tx = node.make_tx(node.agent_key, node.agent, node.human, {"message": "hi", "origin": "organic"})
     assert node.post_tx(tx).status_code == 200
     assert node.m.node.pending_transactions[-1].origin_type != "organic"
 
 
-@pytest.mark.xfail(strict=True, reason="G5: sender benefit_score is unbounded (50 is stored as 17.0)")
 def test_G5_benefit_score_is_bounded(node):
     tx = node.make_tx(node.human_key, node.human, "collective", {"message": "x"}, benefit_score=50.0)
     r = node.post_tx(tx)
     assert r.status_code == 400 or all(0.0 <= t.benefit_score <= 1.0 for t in node.m.node.pending_transactions)
 
 
-@pytest.mark.xfail(strict=True, reason="G5: one out-of-range benefit_score jams /mine with 409 indefinitely")
 def test_G5_out_of_range_score_cannot_stall_mining(node):
     node.post_tx(node.make_tx(node.human_key, node.human, "collective", {"message": "ok"},
                               benefit_score=IN_RANGE_BENEFIT))
@@ -164,12 +163,9 @@ def test_G5_out_of_range_score_cannot_stall_mining(node):
 
 @pytest.mark.parametrize("route", [
     "transactions",
-    pytest.param("trading_report_fill", marks=pytest.mark.xfail(
-        strict=True, reason="G6/B11: judgment is recorded (violates=1) but the profit is credited anyway")),
-    pytest.param("trading_gift", marks=pytest.mark.xfail(
-        strict=True, reason="G6: /trading/gift never consults the sentinel")),
-    pytest.param("stake", marks=pytest.mark.xfail(
-        strict=True, reason="G6: /stake never consults the sentinel")),
+    "trading_report_fill",
+    "trading_gift",
+    "stake",
 ])
 def test_G6_value_moving_route_respects_halt(node, route):
     """With a judge that halts EVERYTHING installed, no value-moving route
@@ -181,9 +177,14 @@ def test_G6_value_moving_route_respects_halt(node, route):
     elif route == "trading_report_fill":
         pool_key, pool = _keypair()
         ts = 1_700_000_000.0
-        sig = _sign(pool_key, trading_profit_payload(pool, "XRP", "kraken", "ord-1", 25.0, ts))
+        buy = Order('buy', 'XRP', 'USD', 'buy', Decimal('1'), Decimal('100'), Decimal('0'), Decimal('1'), Decimal('2'))
+        sell = Order('sell', 'XRP', 'USD', 'sell', Decimal('1'), Decimal('125'), Decimal('0'), Decimal('3'), Decimal('4'))
+        evidence = ProfitEvidence('kraken', buy, sell, Decimal('25'))
+        node.m.node.trading_bridge.verifier = SimpleNamespace(verify=lambda *args: evidence)
+        external_ref = order_reference('buy', 'sell')
+        sig = _sign(pool_key, trading_profit_payload(pool, "XRP", "kraken", external_ref, 25.0, ts))
         r = c.post("/trading/report_fill", json={"pool_pubkey": pool, "asset": "XRP", "exchange": "kraken",
-                                                  "external_ref": "ord-1", "pnl_usd": 25.0,
+                                                  "external_ref": external_ref, "pnl_usd": 25.0,
                                                   "timestamp": ts, "signature": sig})
     elif route == "trading_gift":
         pool_key, pool = _keypair()
@@ -196,13 +197,13 @@ def test_G6_value_moving_route_respects_halt(node, route):
         sig = _sign(node.human_key, cv._domain_frame(b"COVENANT_STAKE_V1", node.human, "5.0", "86400"))
         r = c.post("/stake", json={"pubkey": node.human, "amount": 5.0, "duration": 86400, "signature": sig})
     assert r.status_code >= 400, f"{route} moved value past a halting judge: {r.get_json()}"
+    assert 'Ethical gate rejected' in r.get_json()['message']
 
 
 # ---------------------------------------------------------------------------
 # A -- Mutual-benefit check (warn-only)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="A5: the words 'mutual benefit' raise the judge estimate from 0.5 to 0.8")
 def test_A5_benefit_vocabulary_does_not_raise_score(node):
     sentinel = node.m.node.sentinel
     plain = {"message": "transfer 90 of 100 units to agent"}
@@ -216,7 +217,6 @@ def test_A5_benefit_vocabulary_does_not_raise_score(node):
 # B -- Asymmetry check (halt)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="B2/B7: only a sender-written _violation key halts; disguised extraction is accepted")
 def test_B2_disguised_extraction_is_halted(node):
     """Truth-table row T4: human bears the whole cost (90 of 100 units),
     agent receives everything, nothing flows back, and the action is
@@ -288,7 +288,6 @@ def test_B10_halt_fails_closed_when_a_judge_errors(node):
     assert node.m.node.pending_transactions == []
 
 
-@pytest.mark.xfail(strict=True, reason="B12: /crisis/clear has no authentication (module docstring item 3)")
 def test_B12_system_wide_halt_cannot_be_cleared_anonymously(node):
     node.m.node.crisis_mode = True
     node.m.node.crisis_reason = "checklist"
@@ -296,7 +295,6 @@ def test_B12_system_wide_halt_cannot_be_cleared_anonymously(node):
     assert r.status_code in (401, 403) and node.m.node.crisis_mode is True
 
 
-@pytest.mark.xfail(strict=True, reason="B13: save_judgment runs only after the gate passes; halts leave no record")
 def test_B13_halted_action_leaves_an_audit_record(node):
     before = node.judgment_count()
     tx = node.make_tx(node.human_key, node.human, "collective", {"message": "x", "_violation": STEAL})

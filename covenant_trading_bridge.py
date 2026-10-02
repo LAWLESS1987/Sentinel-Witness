@@ -75,6 +75,8 @@ class TradingBridge:
     def __init__(self, db: Database, sentinel: ReasoningSentinel, staking_pool: StakingPool,
                  succession: SuccessionGuardianSystem, verifier=None):
         self.db = db
+        if sentinel.db is None:
+            sentinel.db = db
         self.sentinel = sentinel
         self.staking_pool = staking_pool
         self.succession = succession
@@ -118,7 +120,10 @@ class TradingBridge:
             raise TradingBridgeError(str(exc)) from None
         record = json.dumps(evidence.record(), sort_keys=True, separators=(',', ':'))
         ref_id = 'trading_profit:' + hashlib.sha256(record.encode()).hexdigest()
-        judgment = self.sentinel.judge.evaluate(evidence.record(), self.sentinel.principles)
+        judgment = self.sentinel.evaluate_action(evidence.record(), ref_id,
+                                                {pool_pubkey_pem: float(claimed)}, record=False)
+        if judgment.violates:
+            raise TradingBridgeError('Ethical gate rejected: ' + judgment.reasoning)
         try:
             with closing(sqlite3.connect(self.db.db_path, timeout=30)) as conn, conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -132,14 +137,15 @@ class TradingBridge:
                 conn.execute('INSERT INTO trading_receipts VALUES (?,?,?)', (ref_id, record, time.time()))
                 for order in (evidence.buy, evidence.sell):
                     conn.execute('INSERT INTO trading_used_orders VALUES (?,?,?)', (exchange, order.order_id, ref_id))
-                conn.execute('INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp) VALUES (?,?,?,?,?,?)',
-                             (ref_id, int(judgment.violates), judgment.reasoning, judgment.principle_violated, judgment.judge_id, time.time()))
+                conn.execute('INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp, warnings) VALUES (?,?,?,?,?,?,?)',
+                             (ref_id, int(judgment.violates), judgment.reasoning, judgment.principle_violated, judgment.judge_id, time.time(), json.dumps(judgment.warnings)))
                 conn.execute('INSERT INTO ledger_entries (pubkey,delta,reason,ref_id,timestamp) VALUES (?,?,?,?,?)',
                              (pool_pubkey_pem, float(claimed), 'trading_profit', ref_id, time.time()))
                 balance = conn.execute('SELECT COALESCE(SUM(delta),0) FROM ledger_entries WHERE pubkey=?', (pool_pubkey_pem,)).fetchone()[0]
         except sqlite3.IntegrityError:
             raise TradingBridgeError('Order already credited or ledger constraint rejected the report') from None
-        return {'credited': float(claimed), 'new_balance': balance, 'judgment': judgment.reasoning, 'ref_id': ref_id}
+        return {'credited': float(claimed), 'new_balance': balance, 'judgment': judgment.reasoning,
+                'warnings': judgment.warnings, 'ref_id': ref_id}
 
     def gift_stake_to_new_node(self, pool_pubkey_pem: str, recipient_pubkey_pem: str, amount: float,
                                 timestamp: float, signature_b64: str) -> dict:
@@ -153,6 +159,12 @@ class TradingBridge:
         if not verify_node_gift_signature(pool_pubkey_pem, recipient_pubkey_pem, amount, timestamp, signature_b64):
             raise TradingBridgeError('Invalid node-gift signature')
         ref_id = 'node_gift:' + hashlib.sha256(node_gift_payload(pool_pubkey_pem, recipient_pubkey_pem, amount, timestamp)).hexdigest()
+        effects = {pool_pubkey_pem: -value}
+        effects[recipient_pubkey_pem] = effects.get(recipient_pubkey_pem, 0) + value
+        judgment = self.sentinel.evaluate_action({'action': 'gift', 'ethics': {'relationship': 'gift'}},
+                                                ref_id, effects, record=False)
+        if judgment.violates:
+            raise TradingBridgeError('Ethical gate rejected: ' + judgment.reasoning)
         try:
             with closing(sqlite3.connect(self.db.db_path, timeout=30)) as conn, conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -165,10 +177,13 @@ class TradingBridge:
                     raise TradingBridgeError('Insufficient pool balance')
                 for pubkey, delta, reason in ((pool_pubkey_pem, -value, 'node_gift_sent'), (recipient_pubkey_pem, value, 'node_gift_received')):
                     conn.execute('INSERT INTO ledger_entries (pubkey,delta,reason,ref_id,timestamp) VALUES (?,?,?,?,?)', (pubkey, delta, reason, ref_id, time.time()))
+                conn.execute('INSERT INTO judgments (tx_id, violates, reasoning, principle_violated, judge_id, timestamp, warnings) VALUES (?,?,?,?,?,?,?)',
+                             (ref_id, int(judgment.violates), judgment.reasoning, judgment.principle_violated, judgment.judge_id, time.time(), json.dumps(judgment.warnings)))
                 balances = [conn.execute('SELECT COALESCE(SUM(delta),0) FROM ledger_entries WHERE pubkey=?', (key,)).fetchone()[0] for key in (pool_pubkey_pem, recipient_pubkey_pem)]
         except sqlite3.IntegrityError:
             raise TradingBridgeError('Gift already processed or ledger constraint rejected the gift') from None
-        return {'gifted': value, 'pool_balance_after': balances[0], 'recipient_balance_after': balances[1], 'ref_id': ref_id}
+        return {'gifted': value, 'pool_balance_after': balances[0], 'recipient_balance_after': balances[1],
+                'warnings': judgment.warnings, 'ref_id': ref_id}
 
     def register_pool_succession(self, pool_pubkey_pem: str, successor_pubkey_pem: str,
                                   guardian_pubkeys: list, threshold: int,
