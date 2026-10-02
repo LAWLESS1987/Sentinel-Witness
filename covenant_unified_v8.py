@@ -3128,22 +3128,27 @@ class CovenantAPI:
         # signature from the trading pool's own key -- same authorization
         # model as /stake, /claim_rewards, /unstake: no separate API auth
         # layer, the signature over the specific action IS the auth.
-        # Nonce/replay protection follows the exact pattern already used by
-        # /claim_rewards and /unstake (nonce_key from action+params+
-        # timestamp, checked via is_nonce_seen/mark_nonce_seen) rather than
-        # inventing a second convention.
+        # Legacy nonce checks remain for older requests. New profit and gift
+        # receipts are permanent and commit atomically inside the bridge.
         # -------------------------------------------------------------
         @self.app.route("/trading/report_fill", methods=["POST"])
         def trading_report_fill():
             if self.node.trading_bridge is None:
                 return jsonify({"status": "error", "message": "Trading bridge not available on this node (covenant_trading_bridge.py not importable)"}), 503
-            data = request.json or {}
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "error", "message": "Expected a JSON object"}), 400
             pool_pubkey = data.get("pool_pubkey", "")
             asset = data.get("asset", "")
             exchange = data.get("exchange", "")
             external_ref = data.get("external_ref", "")
-            pnl_usd = float(data.get("pnl_usd", 0.0))
-            timestamp = float(data.get("timestamp", 0.0))
+            try:
+                if any(isinstance(data.get(key), bool) for key in ("pnl_usd", "timestamp")):
+                    raise ValueError
+                pnl_usd = float(data.get("pnl_usd", 0.0))
+                timestamp = float(data.get("timestamp", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                return jsonify({"status": "error", "message": "Invalid numeric report fields"}), 400
             signature = data.get("signature", "")
             nonce_key = f"trading_profit:{pool_pubkey}:{exchange}:{external_ref}:{timestamp}"
             if self.db.is_nonce_seen(nonce_key):
@@ -3154,18 +3159,24 @@ class CovenantAPI:
                 )
             except TradingBridgeError as e:
                 return jsonify({"status": "error", "message": str(e)}), 400
-            self.db.mark_nonce_seen(nonce_key)
             return jsonify({"status": "success", **result})
 
         @self.app.route("/trading/gift", methods=["POST"])
         def trading_gift():
             if self.node.trading_bridge is None:
                 return jsonify({"status": "error", "message": "Trading bridge not available on this node (covenant_trading_bridge.py not importable)"}), 503
-            data = request.json or {}
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "error", "message": "Expected a JSON object"}), 400
             pool_pubkey = data.get("pool_pubkey", "")
             recipient_pubkey = data.get("recipient_pubkey", "")
-            amount = float(data.get("amount", 0.0))
-            timestamp = float(data.get("timestamp", 0.0))
+            try:
+                if any(isinstance(data.get(key), bool) for key in ("amount", "timestamp")):
+                    raise ValueError
+                amount = float(data.get("amount", 0.0))
+                timestamp = float(data.get("timestamp", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                return jsonify({"status": "error", "message": "Invalid numeric gift fields"}), 400
             signature = data.get("signature", "")
             nonce_key = f"node_gift:{pool_pubkey}:{recipient_pubkey}:{timestamp}"
             if self.db.is_nonce_seen(nonce_key):
@@ -3176,7 +3187,6 @@ class CovenantAPI:
                 )
             except TradingBridgeError as e:
                 return jsonify({"status": "error", "message": str(e)}), 400
-            self.db.mark_nonce_seen(nonce_key)
             return jsonify({"status": "success", **result})
 
     def run(self):
@@ -3608,4 +3618,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # The bridge imports this canonical name. Reuse the running module so
+    # TradingBridgeError is the same class in CLI and imported API execution.
+    sys.modules["covenant_unified_v8"] = sys.modules[__name__]
     main()
