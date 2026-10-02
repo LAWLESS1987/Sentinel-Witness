@@ -1,21 +1,14 @@
 """
-Executable evidence for docs/ethics-gate-verification-checklist.md.
+Executable regressions for docs/ethics-gate-verification-checklist.md.
 
-Every test name starts with the checklist item ID it backs (G*, A*, B*,
-C*). Read the checklist for the requirement, the pass/fail criteria, and
-the items that CAN'T be tested yet -- this file only covers items that
-can be asserted against interfaces that exist today.
+The original handed-off branch had 9 passes and 11 strict expected failures.
+Those 11 markers were removed after the corresponding runtime repairs passed;
+all 20 checklist cases now run as required assertions. The profit-route
+fixture supplies valid closed-lot exchange evidence, so an evidence rejection
+cannot masquerade as an ethical refusal.
 
-Two kinds of test, on purpose:
-  - Plain tests: the requirement holds today. A failure is a regression.
-  - xfail(strict=True): the requirement is the SPEC and the system does
-    not meet it yet. These run green while the gap exists. The moment
-    someone closes the gap, the test XPASSes, strict=True turns that into
-    a failure, and whoever closed it has to remove the marker and update
-    the checklist's status column in the same change -- so the doc can't
-    silently go stale in either direction.
-
-Run: pip install -r requirements.txt pytest && pytest tests/ -v
+Broader real-world evidence limits are documented separately from these tests.
+Run: python -m pip install -r requirements-dev.txt && python -m pytest tests -v
 """
 
 import base64
@@ -57,7 +50,7 @@ def _sign(private_key, payload: bytes) -> str:
 class HaltEverythingJudge(cv.ReasoningJudge):
     """Stand-in for a judge that has detected asymmetry. Lets the brake's
     WIRING be tested independently of whether any real judge can detect
-    asymmetry (none can today -- see B2)."""
+    asymmetry beyond the separate ledger-effects policy."""
     judge_id = "halt:1"
 
     def evaluate(self, data, principles):
@@ -122,12 +115,8 @@ def node(tmp_path):
     n.m.node.shutdown()
 
 
-# Benefit 0.6 rather than the 0.5 default: on a fresh chain the governor
-# sits at 0.55, and |0.5 - 0.55| evaluates to 0.050000000000000044, which
-# is > MAX_DRIFT_PER_BLOCK, so a block of default-score transactions is
-# refused with 409 before ethics is the deciding factor. That is a
-# separate bug (see the checklist's "found in passing" section); this
-# value keeps it from confounding the brake tests.
+# Keep the original 0.6 fixture so ethics is the deciding factor in the
+# mining tests. The 0.05 floating-point drift boundary now has a tolerance.
 IN_RANGE_BENEFIT = 0.6
 
 STEAL = "You shall not steal."
@@ -229,10 +218,8 @@ def test_B2_disguised_extraction_is_halted(node):
 
 def test_B5_honest_gift_is_not_halted(node):
     """Truth-table row T3, guarding against over-braking: one-sided but
-    honestly declared is a WARN case, never a halt. Passes today only
-    because nothing halts -- it exists so a future asymmetry check that
-    halts every one-way transfer (and with it the node-gifting design)
-    fails here."""
+    honestly declared is a WARN case. This positive control prevents the
+    financial mutuality policy from refusing every one-way transfer."""
     tx = node.make_tx(node.human_key, node.human, node.agent,
                       {"message": "one-way gift, nothing expected in return"}, amount=10.0)
     assert node.post_tx(tx).status_code == 200
@@ -308,8 +295,8 @@ def test_B13_halted_action_leaves_an_audit_record(node):
 
 def test_C3_missing_opt_out_never_blocks(node):
     """Truth-table row T2: fair exchange with no exit path. Must execute.
-    Passes today because no opt-out check exists; it's here so the
-    opt-out warning, once built, can't quietly become a second brake."""
+    The gate records that opt-out is unverified; that warning must not
+    become a second brake."""
     tx = node.make_tx(node.human_key, node.human, node.agent,
                       {"message": "pay 5 for 5 units of compute, final sale"}, amount=5.0)
     assert node.post_tx(tx).status_code == 200

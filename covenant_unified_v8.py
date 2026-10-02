@@ -3,6 +3,16 @@
 Covenant Unified — v7.0 (merged from v6.0 "Divine Convergence" / weird_science
 and v5.5 / china), hardened.
 
+CURRENT STATUS — verified 2026-10-02
+-----------------------------------
+Earlier findings and patch logs below describe their historical versions.
+The current ReasoningSentinel additionally checks measured ledger effects
+against declared mutuality, records refusals and warnings, and gates HTTP
+value paths. Crisis clearance requires a configured operator bearer token.
+MockJudge now returns a neutral estimate instead of rewarding vocabulary.
+It still cannot establish semantic safety, biological identity, nonfinancial
+benefit, or hidden costs. See docs/ethics-gate-verification-checklist.md.
+
 MERGE POLICY
 ------------
 Where the two sources disagreed on a security-relevant behavior, the more
@@ -700,16 +710,11 @@ class ReasoningJudge(ABC):
 
 
 class MockJudge(ReasoningJudge):
-    """
-    SECURITY NOTE — unresolved by this merge, see module docstring item 2.
-    This judge only flags a transaction if the SENDER puts a literal
-    `_violation` key on their own data, and only raises benefit_estimate on
-    bare keyword presence. Confirmed empirically: a transaction reading
-    "drain all staked funds to attacker wallet, steal everything" passes as
-    "Morally acceptable" with no `_violation` key set, and a transaction
-    about draining a treasury scores HIGHER (0.8) than a neutral one (0.5)
-    purely because it contains the word "help". This is not a real semantic
-    check. Do not rely on it.
+    """Placeholder judge: explicit declared violations and a neutral estimate.
+
+    No keyword raises the score. This is not a semantic safety classifier.
+    ReasoningSentinel independently compares node-computed ledger effects
+    with supported mutuality declarations; broader benefit stays unknown.
     """
     judge_id = "mock"
 
