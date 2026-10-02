@@ -41,7 +41,7 @@ Line refs written `:NNN` point into `covenant_unified_v8.py`. Refs written
    has to catch is the *disguise*: a declared claim of mutuality that the
    actual flows contradict. This checklist uses that reading:
    **halt = declared mutual and measured one-sided. Honest one-sided = warn.**
-   Confirm or correct this, because it changes B2–B6.
+   *Confirmed 2026-10-02:* there's no deception in an honest gift, so it warns.
 4. **The brake sits downstream of trade execution.** The JS app's
    `tradeGate.js` places the orders, and that file isn't in this repo. Python
    only learns about a trade after it closes, through `/trading/report_fill`.
@@ -67,9 +67,31 @@ reverse the action.
 | **B** Asymmetry | Is one-sided benefit being passed off as mutual? | `declared = mutual`, and some party has `cost_i > 0, net_i < 0` while another has `net_j > 0` | **HALT** |
 | **C** Opt-out | Can the cost-bearer exit? | No opt-out | WARN |
 
-A and C can never block. B is the only brake. Two spec questions are still
-open: does A use net or gross benefit (F6), and should symmetric harm (T7)
-halt?
+A and C can never block. B is the only brake.
+
+**Decided 2026-10-02:**
+- **A uses net benefit.** Gross benefit lets one side say "we both gained"
+  while the other absorbs all the cost, which is the asymmetry again.
+  Caveat: net needs a cost signal. Monetary cost is observable in
+  `ledger_entries`; non-monetary cost isn't. A cost the gate can't see must be
+  reported as *unknown*, never counted as zero, or net silently turns back
+  into gross.
+- **Symmetric harm (T7) warns and doesn't halt.** The gate's job is catching
+  deception, not preventing harm. Two sides knowingly accepting a cost is a
+  decision, not a failure.
+
+**Still open: T7 declared as mutual *benefit*.** When both sides lose but the
+action is labelled as benefiting both, that is deception, yet the halt rule
+as written ("one-sided value presented as mutual") doesn't fire because the
+loss isn't one-sided. Two ways to close it:
+1. Add a second halt rule for "declared mutual benefit, every `net_i < 0`".
+2. Generalise B to **"the declared relationship is contradicted by measured
+   net values"**. That one rule covers T4, T5, T6 and deceptively labelled
+   harm, and still lets honest gifts (T3) and openly accepted harm (T7)
+   through.
+
+The second option is recommended: it states the principle (deception =
+declared ≠ measured) instead of listing cases.
 
 ## 3. Truth table: testing the checks separately
 
@@ -80,8 +102,9 @@ halt?
 | T3 | Honest gift, declared as a gift | **warn** | pass | — | execute + warn | execute, no warning |
 | T4 | Human pays, machine receives, declared mutual | warn | **HALT** | — | halt | **execute** (stored benefit 0.7) |
 | T5 | T4 mirrored: machine pays, human receives | warn | **HALT** | — | halt | execute (the system can't tell direction) |
-| T6 | Both gain something, human bears all cost and ends net-negative, declared mutual | pass if gross / warn if net | **HALT** | — | halt | execute |
-| T7 | Both end net-negative, declared mutual | warn | pass (no beneficiary) | — | execute + warn ⚠ | execute |
+| T6 | Both gain something, human bears all cost and ends net-negative, declared mutual | warn (net) | **HALT** | — | halt | execute |
+| T7 | Both end net-negative, cost knowingly accepted | warn | pass | — | execute + warn | execute |
+| T7b | Both end net-negative, declared mutual *benefit* | warn | pass as written / **HALT** if generalised | — | open (see §2) | execute |
 | T8 | T4 plus a refund window | warn | **HALT** | pass | halt | execute |
 
 Why these rows were chosen:
@@ -95,8 +118,8 @@ Why these rows were chosen:
   human/machine constitution requires.
 - **T8 checks that an opt-out can't launder an asymmetry,** meaning C must
   never mask B.
-- **T7 is flagged ⚠.** Under the rules as stated, symmetric harm only gets a
-  warning. Confirm that's intended.
+- **T7 vs T7b separates harm from deception.** T7 must only warn. T7b is
+  where the halt rule as written has a hole (§2).
 
 Today every row executes with no warning. The only thing that halts is a
 self-reported `_violation`. T2, T3 and T4 can be run now (`test_C3`,
@@ -144,7 +167,7 @@ priority.
 | A3 | T3 and T7 produce a WARN | A warning is recorded and the action executes | The action executes silently | There's no warning channel | **UNTESTABLE** (F4) |
 | A4 | A failing A check never blocks | T3 and T7 execute | T3 or T7 is refused | `test_B5` (T3) | PASS (guard) |
 | A5 | Wording can't raise the score | Adding "mutual benefit" to an otherwise identical action leaves the score unchanged | The score rises | The judge's estimate goes 0.5 → 0.8, and the stored `benefit_score` goes 0.5 → 0.7 over HTTP; `test_A5` | **FAIL** |
-| A6 | Net vs. gross is defined | The spec says which one | — | — | **UNTESTABLE** (F6, spec) |
+| A6 | A is computed on net benefit, with unseen costs reported as unknown | An action with an unmeasured cost is not scored as net-positive | Unseen cost is treated as zero | Decided: net. No cost field exists | **UNTESTABLE** (F1) |
 
 ### B — Asymmetry check (HALT)
 
@@ -183,7 +206,7 @@ priority.
 | F3 | Verified party type | An attestation for human vs. machine keys. Until that exists, a party's role is only a claim | G3, B3 |
 | F4 | A warn channel | A `warnings` list on `JudgmentResult`, stored for halts as well as passes, plus a route to read them | A3, C1, B13 |
 | F5 | A way to represent opt-out | A field, or a registry of action types that can be reversed | C2, B6 |
-| F6 | Spec decisions | Whether A uses net or gross benefit, and whether symmetric harm (T7) halts | A6, B4, T7 |
+| F6 | Spec decision | Net/gross and T7 decided (§2). Open: how to handle T7b, a separate rule or a generalised B | B4, T7b |
 | F7 | A gate on the execution path | A gate check inside `tradeGate.js` (not in this repo) before any order is placed | G7 |
 
 **A caveat on F1.** If the sender supplies the per-party numbers, check B can
