@@ -68,7 +68,10 @@ covenant's node. It planned **no orders**, for these reasons:
 - **Cash is below the 10% floor.** Every buy is blocked, and the R6 weekly contribution stays
   as cash.
 - **XRP is at its frozen floor.** The concentration trim it would otherwise get is dropped.
-- **`contribution_symbols` is empty**, so the weekly contribution has nothing to buy.
+- ~~**`contribution_symbols` is empty**, so the weekly contribution has nothing to buy.~~
+  **Corrected 2026-10-06, and this line was wrong:** an empty `contribution_symbols` means
+  *any* held coin under the 20% cap and above its 200-day line qualifies (`plan()`:
+  `not wanted or p["sym"] in wanted`). The weekly contribution was blocked by cash alone.
 - **No daily plan has been approved in covenant since 2026-09-19.**
 - `armed` is `false` in this folder's config until the operator arms it.
 
@@ -79,8 +82,49 @@ What is public is the code that reads them, the tests that drive it, and the sea
 decision's commitment on the operator's node.
 
 The strategy has no buy signal by design: no timing rule beat chance out of sample
-(`docs/STRATEGY_VALIDATION_2026-09-03.md`). Orders come from the concentration cap, the cash
-floor and the weekly contribution.
+(`docs/STRATEGY_VALIDATION_2026-09-03.md`). On 2026-10-05, orders came from the concentration
+cap, the cash floor and the weekly contribution.
+
+## Operation — every coin but the three is open, 2026-10-06
+
+The operator, 2026-10-06: "We already have a rule about those three. Everything else is good
+to sell in trade." Then: "build on and edit the rules for all bur the 3 we mentioned to begin
+operation i'm willing to take the risk."
+
+It is recorded as `trading_scope` in `trader_config.json`: `open_reserve_pct` plus who, when
+and in what words (`guards.trading_scope`). Anything incomplete is no scope, and the rules
+before it apply. With the record:
+
+- **XRP, HBAR and LINK are untouched.** They keep a 100% reserve of a frozen floor. Anything
+  held above the floor stays tradeable, and adding to them stays allowed. Nothing below
+  applies to them.
+- **Every other coin is open to sell.** The 50% reserve of 2026-09-04 becomes
+  `open_reserve_pct`, set to 0.
+- **R3 is automated**, as MY_STRATEGY.md wrote it: "Flip DOWN through the 200d -> reduce that
+  position toward your floor." An open coin below its 200-day line is sold toward its floor,
+  one capped order a day, until it gets there.
+- **R1's cash sleeve is automated.** If cash is still under 10% after trims and R3, the
+  largest open coin above its line is sold, by the shortfall only. This was the step the
+  planner used to decline: "which position to reduce is a judgement the rules do not make."
+  The record is the operator making that judgement.
+- **A concentration trim on an open coin is cut to one capped order.** Before this, a trim
+  over $25 was proposed at full size and then refused by the cap every day, so it never
+  happened.
+
+Nothing in this section buys on a signal. R6, the weekly contribution, still buys only once
+cash is over the floor. Every order still passes the caps, the guards, the day's approval and
+the seal. `test_sw2_operation.py` drives all of it both ways.
+
+**The plan for 2026-10-06, from this folder (`--plan-only`):** two sells of $25 each, one
+under R3 and one under R1. XRP, HBAR and LINK were left as they were. Which coins, and how far
+cash is from the floor, are portfolio facts. They are not published here, and a reader cannot
+check them.
+
+**The cost, stated with the change.** Selling to build cash, and selling coins below their
+line, costs fees on every order. `signal_ledger.py` charges 1.3% per round trip: the 60 bps
+maker fee each way plus 10 bps of spread.
+It can also sell a coin before it recovers. The regime record that R3 acts on was 0 for 7,
+mean −6.13% after costs, when this was switched on.
 
 ## Commands
 
@@ -116,6 +160,7 @@ balance file are gitignored. This repository is public.
 
 ```
 python test_sw1_witness.py               the waiver, covenant's halt, the bridge, no-covenant refusal
+python test_sw2_operation.py             the trading scope, R3 and the R1 cash sleeve; the three untouched
 python test_g4_money_gates.py            every refusal reason, driven
 python test_f5_reserve.py                the 50% reserve and the frozen hold-only floors
 python test_f7_caps.py                   the per-order and per-day caps

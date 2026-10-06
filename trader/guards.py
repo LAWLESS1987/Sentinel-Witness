@@ -248,6 +248,46 @@ HOLD_ONLY = ("XRP", "HBAR", "LINK")
 FULL_RESERVE_PCT = 1.0
 
 
+TRADING_SCOPE_FIELDS = ("by", "at", "words")
+
+
+def trading_scope(cfg):
+    """The operator's trading scope from cfg["trading_scope"], or None.
+
+    Added 2026-10-06 in Sentinel-Witness on his words: "We already have a rule
+    about those three. Everything else is good to sell in trade." The three are
+    HOLD_ONLY (XRP, HBAR, LINK) and THIS RECORD DOES NOT TOUCH THEM: they keep
+    the 100% reserve of a frozen baseline (reserved_pct ignores `pct` for
+    them), anything held above it stays tradeable, and adding to them stays
+    allowed. What the record sets is the reserve on every OTHER coin --
+    `open_reserve_pct`, the share of its baseline no rule may sell. 0 is fully
+    open; the rule before it was 0.50 ("50% of every current coin should be off
+    limits", 2026-09-04).
+
+    A SCOPE IS A RECORD, like the Rule 5 waiver: `open_reserve_pct` a number in
+    [0, 1] and who, when and in what words, each a non-empty string. Anything
+    malformed is None, and None means the rule before it: half of every other
+    coin reserved."""
+    s = cfg.get("trading_scope") if isinstance(cfg, dict) else None
+    if not isinstance(s, dict):
+        return None
+    pct = s.get("open_reserve_pct")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0.0 <= float(pct) <= 1.0:
+        return None
+    for k in TRADING_SCOPE_FIELDS:
+        v = s.get(k)
+        if not isinstance(v, str) or not v.strip():
+            return None
+    return {"open_reserve_pct": float(pct), "by": s["by"], "at": s["at"], "words": s["words"]}
+
+
+def open_reserve_pct(cfg, default=0.50):
+    """The reserve on every coin that is not HOLD_ONLY: the scope's, or the
+    rule before it. The ONE reading -- plan() and the status line both ask."""
+    s = trading_scope(cfg)
+    return s["open_reserve_pct"] if s is not None else float(default)
+
+
 def reserved_pct(sym, pct=0.50, hold_only=None):
     """The fraction of `sym`'s baseline that no rule may sell into."""
     return (FULL_RESERVE_PCT
