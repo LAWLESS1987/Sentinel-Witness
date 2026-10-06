@@ -32,8 +32,9 @@ all of these:
 
 **Rule 5 was waived on 2026-10-05** by the operator's choice ("Trade now within caps"). On that
 day its record was 7/30 signals settled, 0/7 wins, mean −6.13% after costs. The waiver is a
-record in the local config, printed and sealed every cycle. It deletes no check. Details,
-commands and setup are in [`trader/README.md`](trader/README.md).
+record in the local config, printed and sealed every cycle. It deletes no check. That record,
+and every account fact in these documents, rests on files that are never published, so a
+reader cannot check it. Details, commands and setup are in [`trader/README.md`](trader/README.md).
 
 `trader/venues.py` holds three order adapters: Coinbase, Kraken and Robinhood. Where the venue
 offers a server-side dry run, a disarmed order goes there: Coinbase `/orders/preview`, Kraken

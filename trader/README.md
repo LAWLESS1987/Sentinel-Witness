@@ -72,6 +72,12 @@ covenant's node. It planned **no orders**, for these reasons:
 - **No daily plan has been approved in covenant since 2026-09-19.**
 - `armed` is `false` in this folder's config until the operator arms it.
 
+**A reader cannot check the account facts in this section or the Rule 5 record above.**
+They rest on the exchange account, covenant's `private/RESERVE.json`, its gitignored
+approvals ledger and the gitignored `trader_log.txt`, and none of those is ever published.
+What is public is the code that reads them, the tests that drive it, and the sealed
+decision's commitment on the operator's node.
+
 The strategy has no buy signal by design: no timing rule beat chance out of sample
 (`docs/STRATEGY_VALIDATION_2026-09-03.md`). Orders come from the concentration cap, the cash
 floor and the weekly contribution.
