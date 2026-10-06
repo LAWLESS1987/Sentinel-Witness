@@ -26,3 +26,30 @@ jobs:
         run: python -m unittest -v test_trading_bridge test_exchange_evidence
       - name: Ethics admission, warnings, authenticated recovery and capability regressions
         run: python -m pytest tests -v
+  # trader/ (2026-10-05): the trading program copied from covenant. Each suite
+  # is a script whose exit code is its verdict. This runner has no covenant, so
+  # the checks that need covenant's ledger or seal service print NOT RUN; every
+  # other check runs, and any red suite fails the job after all have run.
+  trader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - name: Trader suites -- waiver, witness, gates, caps, reserve, venues, Rule 5
+        working-directory: trader
+        run: |
+          fail=0
+          for t in test_*.py quant/test_*.py; do
+            echo "::group::$t"
+            python "$t" || { echo "::error::$t failed"; fail=1; }
+            echo "::endgroup::"
+          done
+          exit $fail

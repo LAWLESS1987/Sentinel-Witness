@@ -1,1 +1,30 @@
 cowork/
+
+# --- trader/ (2026-10-05): the same rules covenant keeps for these files ----
+# This repository is public. Nothing that says what is held, how much, or how
+# to reach an exchange account is ever committed. The trader reads its
+# credentials from ~/.coinbase, ~/.kraken and ~/.robinhood, outside any repo.
+*.key
+.venv/
+__pycache__/
+.kraken/
+.coinbase/
+.robinhood/
+cdp_api_key.json
+*_api_key.json
+*_balance.txt
+*_balance.json
+holdings.txt
+holdings.txt.*
+
+# Per-operator runtime state: `armed`, covenant_home and the Rule 5 waiver.
+# trader/trader_config.example.json is the committed shape.
+trader_config.json
+TRADER_HALT
+trader_log.txt
+*.log
+
+# Floors and anything else per-asset. The live floors are covenant's
+# private/RESERVE.json; this folder exists only so a stray write lands
+# somewhere git will not take it.
+private/

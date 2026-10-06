@@ -1,0 +1,29 @@
+{
+  "armed": false,
+  "max_order_usd": 25.0,
+  "max_daily_notional_usd": 50.0,
+  "max_orders_per_day": 2,
+  "min_order_usd": 5.0,
+  "max_position_pct": 0.2,
+  "min_cash_pct": 0.1,
+  "seal_required": true,
+  "min_sealed_signals": 30,
+  "node_ports": [
+    5000
+  ],
+  "node_key": "covenant_A.db.key",
+  "loop_seconds": 3600,
+  "symbols": [],
+  "allow_fiat_buys": true,
+  "weekly_fiat_budget_usd": 100.0,
+  "contribution_min_cash_pct": 0.1,
+  "contribution_symbols": [],
+  "covenant_home": "path/to/your/covenant/checkout",
+  "rule5_waiver": {
+    "waived": false,
+    "by": "",
+    "at": "",
+    "words": "",
+    "_comment": "Rule 5 refuses until this says waived=true with who, when and in what words"
+  }
+}
