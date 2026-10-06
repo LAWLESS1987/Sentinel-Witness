@@ -517,7 +517,17 @@ def plan(cfg, pf, week_spent=0.0):
         return [], ["RESERVE FILE UNREADABLE (%s) -- planning NO sales this "
                     "cycle. The floors are unknown, and unknown is not zero. "
                     "Repair or restore private/RESERVE.json." % e]
-    pct_reserved = 0.50
+    # THE RESERVE ON EVERY COIN THAT IS NOT HOLD-ONLY (Sentinel-Witness,
+    # 2026-10-06): the operator's trading_scope record when there is one, else
+    # the 0.50 before it. The hold-only three ignore this number entirely --
+    # guards.reserved_pct gives them 100% of their frozen floor either way.
+    pct_reserved = _guards.open_reserve_pct(cfg) if _guards else 0.50
+    _scope = _guards.trading_scope(cfg) if _guards else None
+    if _scope is not None:
+        notes.append("scope: every coin but %s is open to sell (%.0f%% reserved, set by %s "
+                     "on %s); those keep their frozen floors"
+                     % ("/".join(getattr(_guards, "HOLD_ONLY", ())), pct_reserved * 100,
+                        _scope["by"], _scope["at"]))
     for r in raised:
         notes.append("reserve: " + r)
 
@@ -561,14 +571,88 @@ def plan(cfg, pf, week_spent=0.0):
                 notes.append("reserve: %s sell DROPPED -- the position is at its reserved floor"
                              % p["sym"])
                 continue
+            # A TRIM THE CAPS WOULD REFUSE NEVER HAPPENS (found 2026-10-06 while
+            # testing the scope). preconditions() refuses an order over
+            # max_order_usd outright rather than shrinking it, so a $62 trim
+            # was proposed every day and placed never. Under the operator's
+            # scope an open coin's trim is cut to one capped order, and the
+            # rest follows on later days. The hold-only three are not cut here
+            # -- they keep exactly the behaviour they had.
+            if (_scope is not None and not hold_only
+                    and over_usd > float(cfg.get("max_order_usd", 25.0))):
+                over_usd = float(cfg.get("max_order_usd", 25.0))
+                qty = over_usd / p["px"]
+                notes.append("R1 concentration cap: %s trim cut to one $%.2f order today; "
+                             "the rest follows on later days" % (p["sym"], over_usd))
             orders.append({"sym": p["sym"], "side": "sell", "qty": qty,
                            "usd": over_usd, "px": p["px"],
                            "rule": "R1 concentration cap",
                            "why": f"{pct:.1%} of portfolio, cap {cap:.0%}",
                            "at": p["at"]})
 
+    # OPERATION (Sentinel-Witness, 2026-10-06). The operator: "build on and edit
+    # the rules for all bur the 3 we mentioned to begin operation i'm willing to
+    # take the risk". Two of his own written rules were never automated, and
+    # with a trading_scope record they now are -- for every coin EXCEPT the
+    # hold-only three, which nothing below can touch:
+    #   R3  "Flip DOWN through the 200d -> reduce that position toward your
+    #       floor." A coin below its line is sold toward its floor, one capped
+    #       order a day, until it is there.
+    #   R1  "Keep a cash sleeve." If cash is still under min_cash_pct after the
+    #       trims and R3, the largest open coins above their line are sold to
+    #       cover the shortfall. This is the judgement the line below used to
+    #       decline to make; the scope record is the operator making it.
+    # Every order is a SELL inside max_order_usd and the day's order count, and
+    # preconditions() still applies every cap, the daily approval and the seal.
+    # Without a scope record none of this runs and the note below is unchanged.
+    _cash_note_done = False
+    if _scope is not None:
+        hold = set(getattr(_guards, "HOLD_ONLY", ()))
+        per = float(cfg.get("max_order_usd", 25.0))
+        min_usd = float(cfg.get("min_order_usd", 5.0))
+        slots = max(0, int(cfg.get("max_orders_per_day", 2)) - len(orders))
+        selling = {o["sym"] for o in orders}
+        need = max(0.0, cfg["min_cash_pct"] * total - pf["cash"] - sum(o["usd"] for o in orders))
+        open_pos = [p for p in pf["positions"] if p["sym"] not in hold and p["sym"] not in selling]
+        down = sorted((p for p in open_pos if p["regime"] == "DOWN"), key=lambda p: -p["val"])
+        up = sorted((p for p in open_pos if p["regime"] != "DOWN"), key=lambda p: -p["val"])
+        for rule, group in (("R3 below the 200d line", down), ("R1 cash sleeve", up)):
+            for p in group:
+                if slots <= 0:
+                    break
+                if rule == "R1 cash sleeve" and need <= 0:
+                    break
+                sellable = _guards.sellable_units(
+                    held_now.get(p["sym"], 0.0), base.get(p["sym"], 0.0),
+                    p["sym"], pct_reserved)
+                room_usd = (sellable or 0.0) * p["px"]
+                want = p["val"] if rule.startswith("R3") else need
+                usd = min(per, room_usd, want)
+                if usd < min_usd:
+                    notes.append("%s: %s -- $%.2f is under the $%.2f minimum order, left as is"
+                                 % (rule, p["sym"], usd, min_usd))
+                    continue
+                orders.append({"sym": p["sym"], "side": "sell", "qty": usd / p["px"],
+                               "usd": usd, "px": p["px"], "rule": rule,
+                               "why": ("%s is below its 200-day line; reduced toward its floor"
+                                       % p["sym"]) if rule.startswith("R3") else
+                                      ("cash under %.0f%%; largest open coin above its line"
+                                       % (cfg["min_cash_pct"] * 100)),
+                               "at": p["at"]})
+                slots -= 1
+                need -= usd
+        cash_pct = pf["cash"] / total
+        if cash_pct < cfg["min_cash_pct"]:
+            raised = sum(o["usd"] for o in orders)
+            short = cfg["min_cash_pct"] * total - pf["cash"]
+            notes.append(f"R1 cash floor: cash {cash_pct:.1%} below {cfg['min_cash_pct']:.0%}; "
+                         f"today's sells raise ${raised:,.0f} of ${short:,.0f}"
+                         + (" -- covered." if raised >= short else
+                            "; the rest continues on later days, inside the daily caps."))
+        _cash_note_done = True
+
     cash_pct = pf["cash"] / total
-    if cash_pct < cfg["min_cash_pct"]:
+    if cash_pct < cfg["min_cash_pct"] and not _cash_note_done:
         need = cfg["min_cash_pct"] * total - pf["cash"]
         raised = sum(o["usd"] for o in orders)
         if raised >= need:
@@ -1062,6 +1146,8 @@ def cmd_status(cfg):
     print(f"  Rule 5 record      : {'CLEARS' if r5['clears'] else 'not yet'} -- {r5['why']}")
     w = _guards.rule5_waiver(cfg) if _guards else None
     print(f"  Rule 5 waiver      : {'WAIVED by %s on %s' % (w['by'], w['at']) if w else 'none -- Rule 5 refuses until it clears'}")
+    sc = _guards.trading_scope(cfg) if _guards else None
+    print(f"  sell reserve       : {'%.0f%% of every coin but XRP/HBAR/LINK (trading_scope, %s on %s)' % (sc['open_reserve_pct'] * 100, sc['by'], sc['at']) if sc else '50% of every coin but XRP/HBAR/LINK (no trading_scope record)'}; XRP/HBAR/LINK: frozen floor")
     print(f"  covenant (witness) : {witness.covenant_home(cfg) or 'NOT CONFIGURED -- no cycle will run'}")
     print(f"  reserve floors     : {RESERVE_PATH} ({'present' if os.path.isfile(RESERVE_PATH) else 'MISSING -- no cycle will run'})")
     print(f"  orders placed today: {len(st.get('orders_today', []))}")

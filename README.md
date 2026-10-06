@@ -30,6 +30,14 @@ all of these:
 - today's approval;
 - the seal.
 
+**Since 2026-10-06, every coin except XRP, HBAR and LINK is open.** It is the operator's
+recorded scope. The three keep their frozen floors. On the open coins:
+
+- the 50% reserve is lifted;
+- a coin below its 200-day line is sold toward its floor;
+- cash under 10% is rebuilt from the largest open coin above its line;
+- each sale is one capped order a day.
+
 **Rule 5 was waived on 2026-10-05** by the operator's choice ("Trade now within caps"). On that
 day its record was 7/30 signals settled, 0/7 wins, mean −6.13% after costs. The waiver is a
 record in the local config, printed and sealed every cycle. It deletes no check. That record,
