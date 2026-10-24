@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from "react";
-import { isValidLimit, computeMaxDailyExposure, computeExposurePctOfBalance } from "../lib/automatedLimits.js";
+import { isValidLimit, computeMaxDailyExposure, computeExposurePctOfBalance } from "./automatedLimits.js";
 
 /**
  * AutomatedSetupModal.jsx
