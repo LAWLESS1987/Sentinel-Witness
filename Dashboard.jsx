@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { TIERS } from "../lib/tradeGate.js";
-import { getTierRank, isTierClickable } from "../lib/tierNavigation.js";
+import { TIERS } from "./tradeGate.js";
+import { getTierRank, isTierClickable } from "./tierNavigation.js";
 import AutomatedSetupModal from "./AutomatedSetupModal.jsx";
 
 /**
