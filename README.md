@@ -1,4 +1,5 @@
 ---
+license: apache-2.0
 pretty_name: Sentinel-Witness
 tags:
   - trading
