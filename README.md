@@ -1,3 +1,12 @@
+---
+pretty_name: Sentinel-Witness
+tags:
+  - trading
+  - dashboard
+  - ledger
+  - crypto
+---
+
 # Ledger Trading Dashboard
 
 Phone-first PWA: Ledger hardware wallet + Coinbase/Kraken/Crypto.com, staged
@@ -113,3 +122,18 @@ the companion `strategy/` project — re-run that periodically, it's
 designed for it). Either replace the `BAKED_IN_GUIDE` constant with fresh
 output, or host the JSON somewhere and call `refreshGuide(url)` so the
 app picks up updates without a rebuild.
+
+
+---
+
+## Part of one system — each piece usable on its own
+
+These repositories are independent instruments that also compose into a single apparatus for **building and honestly auditing trustworthy multi-intelligence systems**. Any one can be used standalone; together they form the stack:
+
+- **Governed core** — [covenant](https://huggingface.co/Lawless1987/covenant): a self-governing multi-agent system with an ethics gate inside the transaction path.
+- **Observability & provenance** — [threefold](https://huggingface.co/Lawless1987/threefold) (the L-lens layer over Jacobian Lens) and [threefold-memory](https://huggingface.co/Lawless1987/threefold-memory) (its persistent, provenance-tracked memory): every action measured and recorded under one task identity.
+- **Measurement instruments** — [contradiction-probe](https://huggingface.co/Lawless1987/contradiction-probe) and [flinch-observability](https://huggingface.co/Lawless1987/flinch-observability), with the session records [flinch-record](https://huggingface.co/Lawless1987/flinch-record) and [grokflinch](https://huggingface.co/Lawless1987/grokflinch): preregistered, blind-scored tests of AI behaviour that embody the covenant's rule — *investigate a signal, never convict on one*.
+- **Neuromorphic research** — [spiking-experiments](https://huggingface.co/Lawless1987/spiking-experiments): from-scratch spiking-network experiments with the pass/fail bar declared before each run.
+- **Ledger surface** — [Sentinel-Witness](https://huggingface.co/Lawless1987/Sentinel-Witness): the trading / ledger dashboard.
+
+**This repository's place in it:** the ledger / trading-dashboard surface.
