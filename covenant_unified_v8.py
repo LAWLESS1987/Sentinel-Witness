@@ -2705,6 +2705,37 @@ class Database:
             row = conn.execute("SELECT 1 FROM seen_nonces WHERE nonce = ? AND expiry > ?", (nonce, time.time())).fetchone()
             return row is not None
 
+    def reserve_nonce(self, nonce: str, expiry: int = 86400) -> bool:
+        """Atomically reserve `nonce`: True if it was free (now reserved), False if a LIVE reservation already
+        exists (a replay). Replaces the is_nonce_seen() + mark_nonce_seen() check-then-mark, which used two
+        SEPARATE connections, so two concurrent callers could both pass the check before either marked
+        (A / Codex #10.1). `nonce` is the PRIMARY KEY, so the INSERT fails atomically on a duplicate; an EXPIRED
+        reservation is cleared first so the nonce can be reused after `expiry`, matching is_nonce_seen's window.
+        An empty nonce reserves nothing and returns True (is_nonce_seen treats empty as not-seen). BEGIN
+        IMMEDIATE takes the write lock up front so concurrent reservers serialize without a deadlock."""
+        from contextlib import closing
+        if not nonce:
+            return True
+        now = time.time()
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM seen_nonces WHERE nonce = ? AND expiry <= ?", (nonce, now))
+            try:
+                conn.execute("INSERT INTO seen_nonces (nonce, expiry) VALUES (?, ?)", (nonce, now + expiry))
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def release_nonce(self, nonce: str) -> None:
+        """Undo a reserve_nonce() -- ONLY for a reserved action that then FAILED and may be legitimately
+        retried (e.g. /succession/confirm, which marked the nonce only on success). A concurrent duplicate was
+        already rejected; releasing lets a genuine retry reuse the nonce."""
+        from contextlib import closing
+        if not nonce:
+            return
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
+            conn.execute("DELETE FROM seen_nonces WHERE nonce = ?", (nonce,))
+
 
 # ---------------------------------------------------------------------------
 # Network Layer: P2P Node
@@ -2889,9 +2920,8 @@ class CovenantAPI:
             # it the same tx content can be submitted repeatedly and inflate
             # its own influence on a block's alignment_score / friendship.
             nonce_key = f"http:{tx.get_id()}:{tx.timestamp}"
-            if self.db.is_nonce_seen(nonce_key):
+            if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate transaction"}), 400
-            self.db.mark_nonce_seen(nonce_key)
             with self.node.chain_lock:
                 self.node.pending_transactions.append(tx)
             self.node.propagate_transaction(tx)
@@ -2945,9 +2975,8 @@ class CovenantAPI:
             if gate.violates:
                 return jsonify({'status': 'error', 'message': 'Ethical gate rejected: ' + gate.reasoning}), 400
             nonce_key = f"stake_action:claim:{pubkey}:{timestamp}"
-            if self.db.is_nonce_seen(nonce_key):
+            if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed claim signature"}), 400
-            self.db.mark_nonce_seen(nonce_key)
             rewards, message = self.node.staking_pool.claim_rewards(pubkey)
             return jsonify({"status": "success", "rewards": rewards, "message": message})
 
@@ -2968,9 +2997,8 @@ class CovenantAPI:
             if gate.violates:
                 return jsonify({'status': 'error', 'message': 'Ethical gate rejected: ' + gate.reasoning}), 400
             nonce_key = f"stake_action:unstake:{pubkey}:{timestamp}"
-            if self.db.is_nonce_seen(nonce_key):
+            if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed unstake signature"}), 400
-            self.db.mark_nonce_seen(nonce_key)
             payout, message = self.node.staking_pool.unstake(pubkey)
             return jsonify({"status": "success", "payout": payout, "message": message})
 
@@ -3037,12 +3065,11 @@ class CovenantAPI:
             signature = data.get("signature", "")
             confirm_type = data.get("confirm_type", "incapacitation")
             nonce_key = f"succession_confirm:{primary_pubkey}:{guardian_pubkey}:{confirm_type}:{timestamp}"
-            if self.db.is_nonce_seen(nonce_key):
+            if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed confirmation"}), 400
             ok, message = self.node.succession.confirm(primary_pubkey, guardian_pubkey, timestamp, signature, confirm_type)
-            if ok:
-                self.db.mark_nonce_seen(nonce_key)
             if not ok:
+                self.db.release_nonce(nonce_key)   # the confirm failed; let a genuine retry reuse the nonce
                 return jsonify({"status": "error", "message": message}), 400
             return jsonify({"status": "success", "message": message})
 
@@ -3482,9 +3509,8 @@ class CovenantUnifiedMaster:
             # Replay protection -- weird_science had none of this at all.
             nonce = msg.get("nonce")
             if nonce is not None:
-                if self.db.is_nonce_seen(nonce):
+                if not self.db.reserve_nonce(nonce):
                     return
-                self.db.mark_nonce_seen(nonce)
 
             if msg.get("type") == "BLOCK_PROPAGATE":
                 bdata = msg["block"]
@@ -3524,9 +3550,8 @@ class CovenantUnifiedMaster:
                 if tx.amount > 0 and self.db.get_balance(tx.sender_pubkey) < tx.amount:
                     return
                 tx_seen_key = f"p2p_tx:{tx.get_id()}"
-                if self.db.is_nonce_seen(tx_seen_key):
+                if not self.db.reserve_nonce(tx_seen_key):
                     return
-                self.db.mark_nonce_seen(tx_seen_key)
                 with self.node.chain_lock:
                     self.node.pending_transactions.append(tx)
         except Exception:
@@ -3550,9 +3575,8 @@ class CovenantUnifiedMaster:
                 return
             nonce = msg.get("nonce")
             if nonce is not None:
-                if self.db.is_nonce_seen(nonce):
+                if not self.db.reserve_nonce(nonce):
                     return
-                self.db.mark_nonce_seen(nonce)
 
             bdata = msg["block"]
             txs = [Transaction(**tx) for tx in bdata.pop("transactions", [])]
