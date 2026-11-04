@@ -2978,6 +2978,13 @@ class CovenantAPI:
             if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed claim signature"}), 400
             rewards, message = self.node.staking_pool.claim_rewards(pubkey)
+            if rewards <= 0:
+                # Nothing was credited (locked, no rewards yet, or no stake): do NOT consume the signed nonce
+                # on a no-op, so the same request succeeds once a reward exists. A successful claim keeps the
+                # nonce reserved, so a replay is still rejected. (Full crash-atomicity of reserve+credit as one
+                # DB transaction is a larger money-core refactor, deliberately not done here; the gift path
+                # (gift_stake_to_new_node) is already one atomic transaction.)
+                self.db.release_nonce(nonce_key)
             return jsonify({"status": "success", "rewards": rewards, "message": message})
 
         @self.app.route("/unstake", methods=["POST"])
@@ -3000,6 +3007,8 @@ class CovenantAPI:
             if not self.db.reserve_nonce(nonce_key):
                 return jsonify({"status": "error", "message": "Duplicate/replayed unstake signature"}), 400
             payout, message = self.node.staking_pool.unstake(pubkey)
+            if payout <= 0:
+                self.db.release_nonce(nonce_key)      # no-op unstake (locked / no stake): do not burn the signed nonce
             return jsonify({"status": "success", "payout": payout, "message": message})
 
         @self.app.route("/succession/register", methods=["POST"])
