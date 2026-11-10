@@ -28,6 +28,23 @@ it has a .venv, so the code that signs is the code covenant runs.
 EVERY FAILURE REFUSES. No covenant_home, no interpreter, a timeout, a crash,
 unparseable output -- each one is a refusal with its reason, never a pass.
 
+THE WITNESS OWNS ITS OWN TERMS (SW3, 2026-11-09). Until today the seal call
+handed covenant THIS trader's cfg, and covenant's seal read node_key,
+node_ports and the xrpl_* switches out of it -- so the party being witnessed
+chose which node sealed and which key signed (covenant's consult of
+2026-10-30, finding 1). Now only the record crosses the boundary. Covenant
+reads those terms from its own trader_config.json over its own defaults,
+refuses a key that is not a file inside its own folder and ports that are not
+a list of port numbers, and says so in the answer ("terms": "covenant"). And
+an ARMED config that turns the seal off is refused for the whole cycle
+(terms_reasons): Sentinel-Witness places nothing unwitnessed.
+
+WHAT THIS DOES NOT DO, said here so nobody reads more into it: the subprocess
+is still this OS user on this host, and this file still supplies the script
+it runs. Someone who can edit this file, or covenant's folder, is not stopped.
+What is closed is the config road -- an edited or second trader_config.json
+can no longer move the seal.
+
 WHERE COVENANT IS: env SENTINEL_COVENANT_HOME, else trader_config.json
 "covenant_home". There is no built-in default, so a machine without covenant
 cannot trade by accident.
@@ -95,14 +112,62 @@ def _python(home):
 # Runs inside covenant's folder. Reads one JSON object on stdin and prints one
 # JSON object as the LAST line of stdout; anything the imported modules print
 # before it is ignored by the parser below.
+#
+# SW3: the request carries the RECORD and nothing else. The terms of the seal
+# -- which key signs, which node is asked, whether a public record is written
+# -- are covenant's, read here from covenant's own file over covenant's own
+# defaults. A "cfg" in the request is ignored, not merged.
+TERM_KEYS = ("node_key", "node_ports", "xrpl_record", "xrpl_network",
+             "xrpl_allow_mainnet")
+
 _SEAL_SCRIPT = r"""
-import json, sys
+import json, os, sys
 sys.path.insert(0, ".")
 req = json.loads(sys.stdin.read())
 import covenant_trader as T
-r = T.seal_decision_result(req["cfg"], req["record"])
+
+def refuse(why):
+    print(json.dumps({"ok": False, "status": None, "admission": None,
+                      "tx_id": None, "held_not_judged": False,
+                      "not_proven": False, "terms": "covenant",
+                      "detail": "witness terms: " + why, "mined": ""}))
+    sys.exit(0)
+
+home = os.path.realpath(os.getcwd())
+own = dict(getattr(T, "DEFAULT_CONFIG", {}))
+p = os.path.join(home, "trader_config.json")
+if os.path.isfile(p):
+    try:
+        with open(p, encoding="utf-8") as fh:
+            mine = json.load(fh)
+    except (OSError, ValueError) as e:
+        refuse("covenant's own trader_config.json will not parse (%s)" % type(e).__name__)
+    if not isinstance(mine, dict):
+        refuse("covenant's own trader_config.json is not an object")
+    own.update(mine)
+terms = {k: own.get(k) for k in TERM_KEYS_HERE}
+
+key = terms.get("node_key")
+if not isinstance(key, str) or not key.strip():
+    refuse("covenant names no node_key")
+full = os.path.realpath(os.path.join(home, key))
+try:
+    inside = os.path.commonpath([full, home]) == home and full != home
+except ValueError:
+    inside = False
+if os.path.isabs(key) or os.path.splitdrive(key)[0] or not inside:
+    refuse("node_key must be a file inside covenant's own folder")
+ports = terms.get("node_ports")
+if (not isinstance(ports, list) or not ports or
+        any(isinstance(x, bool) or not isinstance(x, int) or not 0 < x < 65536
+            for x in ports)):
+    refuse("node_ports must be a non-empty list of port numbers")
+
+r = T.seal_decision_result(terms, req["record"])
+if isinstance(r, dict):
+    r["terms"] = "covenant"
 print(json.dumps(r))
-"""
+""".replace("TERM_KEYS_HERE", repr(TERM_KEYS))
 
 # `now` is an epoch number or null, which is what covenant_daily_plan.today()
 # takes (time.localtime(now)).
@@ -115,12 +180,23 @@ print(json.dumps(D.gate_reasons(now=req.get("now"))))
 """
 
 
+def _child_env():
+    """This process's environment without the variables that tell a Python
+    interpreter WHAT CODE TO LOAD (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME,
+    PYTHONINSPECT ...). SW3: the reason for a subprocess is that covenant's
+    code signs the seal; a PYTHONPATH inherited from whatever started this
+    trader would put some other folder's covenant_trader.py first. Everything
+    else is kept -- covenant reads its own COVENANT_* settings."""
+    return {k: v for k, v in os.environ.items()
+            if not k.upper().startswith("PYTHON")}
+
+
 def _run(home, script, payload, timeout):
     """(ok, parsed-last-line-or-None, why)."""
     try:
         p = subprocess.run([_python(home), "-c", script], cwd=home,
                            input=json.dumps(payload), capture_output=True,
-                           text=True, timeout=timeout)
+                           text=True, timeout=timeout, env=_child_env())
     except subprocess.TimeoutExpired:
         return False, None, "covenant did not answer within %d s" % timeout
     except OSError as e:
@@ -148,13 +224,35 @@ def seal_decision_result(cfg, record, runner=None):
         return _refused("witness: covenant_home is not configured (env "
                         "SENTINEL_COVENANT_HOME or trader_config.json), so "
                         "nothing can be sealed")
+    # SW3: `cfg` finds covenant and goes no further. Only the record crosses.
     ok, out, why = (runner or _run)(home, _SEAL_SCRIPT,
-                                    {"cfg": cfg, "record": record}, SEAL_TIMEOUT_S)
+                                    {"record": record}, SEAL_TIMEOUT_S)
     if not ok:
         return _refused("witness: " + why)
     if not isinstance(out, dict) or "ok" not in out:
         return _refused("witness: covenant's seal answer had no 'ok' field")
+    # SW3: `ok` is a yes only as the boolean true. A truthy string ("false",
+    # "no") or a number would otherwise read as sealed downstream.
+    if not isinstance(out["ok"], bool):
+        return _refused("witness: covenant's seal answer had an 'ok' that is "
+                        "not true or false (%s)" % type(out["ok"]).__name__)
     return out
+
+
+def terms_reasons(cfg):
+    """Why this trader's config is LOOSER than the witness allows. [] is clear.
+
+    SW3. One term today: an armed config may not switch the seal off. With
+    seal_required false a refused seal does not stop a live order
+    (guards.preconditions), so the switch was a way to trade unwitnessed, and
+    it sat in the executor's own gitignored file. A disarmed config is left
+    alone: it places nothing, and plan-only runs and the copied suites use it."""
+    if not isinstance(cfg, dict) or not cfg.get("armed"):
+        return []
+    if cfg.get("seal_required") is not True:
+        return ["armed with seal_required not true -- Sentinel-Witness places "
+                "nothing unwitnessed; set seal_required to true"]
+    return []
 
 
 def daily_plan_gate_reasons(now=None, cfg=None, runner=None):

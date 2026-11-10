@@ -22,6 +22,18 @@ older `covenant_unified_v8.py` at the root. Every failure to reach covenant is a
 no `covenant_home` configured, or no floor file, a cycle reads, plans, seals and sends
 nothing.
 
+**The witness owns its terms (SW3, 2026-11-09).** Until that day the seal call handed covenant
+this trader's own config, and covenant's seal took the node key, the node port and the
+public-ledger switches from it, so the party being witnessed chose who sealed. Now only the
+record crosses. Covenant reads those terms from its own `trader_config.json`, refuses a key
+outside its own folder, and the answer carries `"terms": "covenant"`. The Python that runs in
+covenant no longer inherits `PYTHONPATH` and its relatives from this process, a seal's `ok`
+counts only as the boolean true, and an armed config with `seal_required` off refuses the whole
+cycle. What this does not do: the subprocess is still the same user on the same machine, and
+the caps are still set in this trader's own config. See
+[`docs/AUTO_TRADING_PLAN_2026-11-09.md`](docs/AUTO_TRADING_PLAN_2026-11-09.md) for what is
+still open before arming.
+
 ## Venues
 
 `venues.py` holds three order adapters: **Coinbase**, **Kraken** and **Robinhood**. A
@@ -161,6 +173,7 @@ balance file are gitignored. This repository is public.
 ```
 python test_sw1_witness.py               the waiver, covenant's halt, the bridge, no-covenant refusal
 python test_sw2_operation.py             the trading scope, R3 and the R1 cash sleeve; the three untouched
+python test_sw3_witness_terms.py         covenant seals on its own terms, whatever this trader's config says
 python test_g4_money_gates.py            every refusal reason, driven
 python test_f5_reserve.py                the 50% reserve and the frozen hold-only floors
 python test_f7_caps.py                   the per-order and per-day caps
