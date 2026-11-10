@@ -122,6 +122,13 @@ before it apply. With the record:
 - **A concentration trim on an open coin is cut to one capped order.** Before this, a trim
   over $25 was proposed at full size and then refused by the cap every day, so it never
   happened.
+- **A trim the cap will refuse is marked, and counts for nothing (SW4, 2026-11-09).** The three
+  are not cut to a capped order, so a trim of what one of them holds above its floor can be
+  proposed at more than $25. The cap refuses it every day. It is still shown and sealed, now
+  marked `unplaceable`. Before this it also used one of the day's order slots, was counted as
+  cash raised (so the plan called the cash floor "covered" by a sale that would not happen),
+  and counted as cash on hand for the R6 contribution. It does none of those now. The three
+  are still never sold by this. `test_sw4_unplaceable.py`.
 
 Nothing in this section buys on a signal. R6, the weekly contribution, still buys only once
 cash is over the floor. Every order still passes the caps, the guards, the day's approval and
@@ -174,6 +181,7 @@ balance file are gitignored. This repository is public.
 python test_sw1_witness.py               the waiver, covenant's halt, the bridge, no-covenant refusal
 python test_sw2_operation.py             the trading scope, R3 and the R1 cash sleeve; the three untouched
 python test_sw3_witness_terms.py         covenant seals on its own terms, whatever this trader's config says
+python test_sw4_unplaceable.py           an order the cap will refuse takes no slot and is not cash
 python test_g4_money_gates.py            every refusal reason, driven
 python test_f5_reserve.py                the 50% reserve and the frozen hold-only floors
 python test_f7_caps.py                   the per-order and per-day caps
