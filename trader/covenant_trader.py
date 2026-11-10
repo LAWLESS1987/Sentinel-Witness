@@ -911,6 +911,12 @@ def witness_ready(cfg, reserve=None):
     if not os.path.isfile(path):
         return ("covenant's reserve file is missing at %s -- Sentinel-Witness "
                 "never creates floors; restore it in covenant first" % path)
+    # SW3 (2026-11-09): the witness's terms. An armed config looser than the
+    # witness allows refuses the cycle here, before anything is read or
+    # planned, for the same reason as the two above: nothing is written.
+    loose = witness.terms_reasons(cfg)
+    if loose:
+        return "; ".join(loose)
     return None
 
 
