@@ -584,11 +584,29 @@ def plan(cfg, pf, week_spent=0.0):
                 qty = over_usd / p["px"]
                 notes.append("R1 concentration cap: %s trim cut to one $%.2f order today; "
                              "the rest follows on later days" % (p["sym"], over_usd))
-            orders.append({"sym": p["sym"], "side": "sell", "qty": qty,
-                           "usd": over_usd, "px": p["px"],
-                           "rule": "R1 concentration cap",
-                           "why": f"{pct:.1%} of portfolio, cap {cap:.0%}",
-                           "at": p["at"]})
+            trim = {"sym": p["sym"], "side": "sell", "qty": qty,
+                    "usd": over_usd, "px": p["px"],
+                    "rule": "R1 concentration cap",
+                    "why": f"{pct:.1%} of portfolio, cap {cap:.0%}",
+                    "at": p["at"]}
+            # SW4 (2026-11-09): A TRIM THE CAP WILL REFUSE IS SAID TO BE ONE.
+            # The hold-only three are not cut above, on purpose, so their trim
+            # is proposed at full size and preconditions() refuses it as over
+            # max_order_usd every day. Until today that never-placed order
+            # still took one of the day's order slots, was subtracted from the
+            # cash shortfall ("covered" by a sale that would not happen), and
+            # counted as cash on hand for R6. It is still proposed, printed and
+            # sealed; it is marked, and _counted() below leaves it out of every
+            # sum. The operator's choice: stop it distorting the plan, do NOT
+            # start cutting the three's trims.
+            _cap_usd = float(cfg.get("max_order_usd", 25.0))
+            if _scope is not None and over_usd > _cap_usd + 1e-9:
+                trim["unplaceable"] = ("$%.2f is over the $%.2f order cap, and a hold-only "
+                                       "trim is not cut to fit it" % (over_usd, _cap_usd))
+                notes.append("R1 concentration cap: %s trim of $%.2f is over the $%.2f order "
+                             "cap and will be refused; it takes no order slot and is not "
+                             "counted as cash raised" % (p["sym"], over_usd, _cap_usd))
+            orders.append(trim)
 
     # OPERATION (Sentinel-Witness, 2026-10-06). The operator: "build on and edit
     # the rules for all bur the 3 we mentioned to begin operation i'm willing to
@@ -605,14 +623,20 @@ def plan(cfg, pf, week_spent=0.0):
     # Every order is a SELL inside max_order_usd and the day's order count, and
     # preconditions() still applies every cap, the daily approval and the seal.
     # Without a scope record none of this runs and the note below is unchanged.
+    def _counted(os_):
+        """The orders that can be placed: every slot count and every sum of
+        dollars raised below reads this, never `orders` itself (SW4)."""
+        return [o for o in os_ if not o.get("unplaceable")]
+
     _cash_note_done = False
     if _scope is not None:
         hold = set(getattr(_guards, "HOLD_ONLY", ()))
         per = float(cfg.get("max_order_usd", 25.0))
         min_usd = float(cfg.get("min_order_usd", 5.0))
-        slots = max(0, int(cfg.get("max_orders_per_day", 2)) - len(orders))
+        slots = max(0, int(cfg.get("max_orders_per_day", 2)) - len(_counted(orders)))
         selling = {o["sym"] for o in orders}
-        need = max(0.0, cfg["min_cash_pct"] * total - pf["cash"] - sum(o["usd"] for o in orders))
+        need = max(0.0, cfg["min_cash_pct"] * total - pf["cash"]
+                   - sum(o["usd"] for o in _counted(orders)))
         open_pos = [p for p in pf["positions"] if p["sym"] not in hold and p["sym"] not in selling]
         down = sorted((p for p in open_pos if p["regime"] == "DOWN"), key=lambda p: -p["val"])
         up = sorted((p for p in open_pos if p["regime"] != "DOWN"), key=lambda p: -p["val"])
@@ -643,7 +667,7 @@ def plan(cfg, pf, week_spent=0.0):
                 need -= usd
         cash_pct = pf["cash"] / total
         if cash_pct < cfg["min_cash_pct"]:
-            raised = sum(o["usd"] for o in orders)
+            raised = sum(o["usd"] for o in _counted(orders))
             short = cfg["min_cash_pct"] * total - pf["cash"]
             notes.append(f"R1 cash floor: cash {cash_pct:.1%} below {cfg['min_cash_pct']:.0%}; "
                          f"today's sells raise ${raised:,.0f} of ${short:,.0f}"
@@ -682,7 +706,7 @@ def plan(cfg, pf, week_spent=0.0):
     weekly = float(cfg.get("weekly_fiat_budget_usd") or 0.0)
     if cfg.get("allow_fiat_buys") and weekly > 0:
         floor_pct = float(cfg.get("contribution_min_cash_pct", cfg.get("min_cash_pct", 0.10)))
-        cash_after = pf["cash"] + sum(o["usd"] for o in orders)   # today's trims raise cash first
+        cash_after = pf["cash"] + sum(o["usd"] for o in _counted(orders))   # today's trims raise cash first
         spare = cash_after - floor_pct * total
         room = min(weekly - float(week_spent or 0.0), spare)
         # HOLD-ONLY IS NO LONGER EXCLUDED FROM CONTRIBUTIONS (2026-09-07,
@@ -702,7 +726,7 @@ def plan(cfg, pf, week_spent=0.0):
                         if p["regime"] == "UP" and p["val"] / total < cap
                         and (not wanted or p["sym"] in wanted)]
             eligible.sort(key=lambda p: p["val"])                 # smallest first: equalise
-            slots = max(0, int(cfg.get("max_orders_per_day", 2)) - len(orders))
+            slots = max(0, int(cfg.get("max_orders_per_day", 2)) - len(_counted(orders)))
             n = min(len(eligible), slots)
             if not eligible:
                 notes.append("R6 contribution: no held asset is both under the cap and above "
