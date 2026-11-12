@@ -513,11 +513,20 @@ def gather(cfg):
     cash = sum(a for s, per in merged.items()
                if s in ("USD", "USDC", "USDT") for a in per.values())
     syms = [s for s in merged if s not in ("USD", "USDC", "USDT")]
-    if cfg.get("symbols"):
-        syms = [s for s in syms if s in cfg["symbols"]]
+    # R3 (2026-11-12): `symbols` SAYS WHAT MAY BE TRADED. IT DOES NOT SAY WHAT
+    # IS HELD. This used to drop every holding not in the list before pricing,
+    # so it was missing from `total` exactly as an unpriced holding was (H3):
+    # with XLM in the list and a larger ETH holding outside it, XLM at 15% of
+    # the book read as 57%, the concentration cap asked for a trim, and a sale
+    # was planned. Every holding is now priced. One outside the list goes to
+    # `outside` -- counted in `total`, shown, in the guards' book, and never
+    # given an order (plan() walks `positions` only). One outside the list
+    # that cannot be priced is unpriced like any other, and plan() plans
+    # nothing: it is either counted or the cycle stops.
+    wanted = set(cfg.get("symbols") or [])
 
     prices = daily.prefetch(syms, "both") if syms else {}
-    positions, unpriced = [], []
+    positions, unpriced, outside = [], [], []
     for s in sorted(syms):
         px, closes, why, _n, _d = prices.get(s, (None, None, "not fetched", [], []))
         qty = sum(merged[s].values())
@@ -532,13 +541,14 @@ def gather(cfg):
                              "why": "price %r is not a finite number above zero" % (px,)})
             continue
         s200 = statistics.fmean(closes) if closes and len(closes) >= 50 else None
-        positions.append({"sym": s, "qty": qty, "px": px, "val": qty * px,
-                          "s200": s200, "bars": len(closes) if closes else 0,
-                          "regime": ("UP" if s200 and px >= s200 else
-                                     "DOWN" if s200 else "n/a"),
-                          "at": dict(merged[s])})
-    total = sum(p["val"] for p in positions) + cash
-    return {"positions": positions, "cash": cash, "total": total,
+        (outside if wanted and s not in wanted else positions).append(
+            {"sym": s, "qty": qty, "px": px, "val": qty * px,
+             "s200": s200, "bars": len(closes) if closes else 0,
+             "regime": ("UP" if s200 and px >= s200 else
+                        "DOWN" if s200 else "n/a"),
+             "at": dict(merged[s])})
+    total = sum(p["val"] for p in positions) + sum(p["val"] for p in outside) + cash
+    return {"positions": positions, "cash": cash, "total": total, "outside": outside,
             "unpriced": unpriced, "venue_notes": venue_notes,
             "venues_read": sorted(per_venue), "venues_failed": sorted(venues_failed),
             "open_orders": open_orders, "open_orders_unread": sorted(open_unread),
@@ -1549,6 +1559,11 @@ def run_once(cfg, plan_only=False):
         print(f"    {p['sym']:<6}{p['qty']:>16,.6f} {p['px']:>12,.6f} "
               f"{p['val']:>10,.2f} {pct:>6.1%}  {p['regime']:<4} "
               f"@{'+'.join(p['at'])}")
+    for p in pf.get("outside") or []:                                          # R3
+        pct = p["val"] / pf["total"] if pf["total"] else 0
+        print(f"    {p['sym']:<6}{p['qty']:>16,.6f} {p['px']:>12,.6f} "
+              f"{p['val']:>10,.2f} {pct:>6.1%}  held, not in `symbols`: counted in the "
+              f"total, never traded")
     for u in pf["unpriced"]:
         print(f"    {u['sym']:<6}{u['qty']:>16,.6f}  NO PRICE -- {u['why']}")
     if pf["total"]:
@@ -1578,7 +1593,9 @@ def run_once(cfg, plan_only=False):
             equity_start_of_day=st["equity_start_of_day"],
             closed_trades=st.get("closed_trades", []),
             last_sold=st.get("last_sold", {}),
-            positions={p["sym"]: p["val"] for p in pf["positions"]},
+            # R3: the guards' book is the whole book -- a holding outside
+            # `symbols` is in it, or cash and every position read too large.
+            positions={p["sym"]: p["val"] for p in list(pf["positions"]) + list(pf.get("outside") or [])},
             cash=pf["cash"],
             orders_today=_guards.orders_today_from(st),
             # The ONLY place this is written, and only from a real portfolio
@@ -1674,6 +1691,7 @@ def run_once(cfg, plan_only=False):
     snapshot = {"at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "total": round(pf["total"], 2), "cash": round(pf["cash"], 2),
                 "positions": {p["sym"]: round(p["val"], 2) for p in pf["positions"]},
+                "outside_symbols": {p["sym"]: round(p["val"], 2) for p in pf.get("outside") or []},
                 "regimes": {p["sym"]: p["regime"] for p in pf["positions"]},
                 "unpriced": [u["sym"] for u in pf["unpriced"]],
                 "orders": [{k: o[k] for k in ("sym", "side", "qty", "usd", "rule")} for o in orders],
