@@ -953,7 +953,7 @@ def plan(cfg, pf, week_spent=0.0):
 
 
 # ------------------------------------------------------------------ execution
-def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks):
+def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None):
     """Every reason this specific order may not go live. Empty list = clear.
 
     ONE IMPLEMENTATION SINCE 2026-09-07. The rule moved to guards.py so that
@@ -970,9 +970,33 @@ def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks):
     if _guards is None:
         return ["guards.py unavailable -- the per-trade and per-day caps "
                 "cannot be evaluated"]
-    return _guards.preconditions(order, cfg=cfg, st=st,
-                                 sealed_ok=bool(sealed_ok),
-                                 guard_blocks=guard_blocks, caller="trader")
+    bad = _guards.preconditions(order, cfg=cfg, st=st,
+                                sealed_ok=bool(sealed_ok),
+                                guard_blocks=guard_blocks, caller="trader")
+    # H8 (2026-11-12): THE APPROVAL BINDS THE ORDER. The gate inside
+    # guards.preconditions asked whether today is approved; this asks whether
+    # THIS order is one the approved plan proposed -- and only once everything
+    # else has cleared, so a disarmed or refused order never starts covenant.
+    #
+    # `approval` is None for a caller that is not about to place anything (the
+    # shape every caller had before today). execute() passes a one-slot holder,
+    # {"record": ...}: the record is fetched from the witness the first time it
+    # is needed and reused for the rest of the cycle. It is here, in the one
+    # function that answers "may this order go live", rather than beside it in
+    # execute(): the first cut put it there, and test_f7_caps.py's bookkeeping
+    # harness -- which replaces this function to let an order through -- was
+    # refused by a check it had not replaced.
+    if (not bad and approval is not None and isinstance(cfg, dict)
+            and cfg.get("daily_plan_required", True)):
+        if approval.get("record") is None:
+            try:
+                approval["record"] = witness.approval_record(cfg=cfg)
+            except Exception as e:                                # noqa: BLE001
+                approval["record"] = {"ok": False,
+                                      "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
+        bad = list(_guards.approval_reasons(order, approval["record"],
+                                            st.get("orders_today") if isinstance(st, dict) else None))
+    return bad
 
 
 def _malformed_order(o):
@@ -1025,6 +1049,8 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     # H8 (2026-11-12): `approval` -- covenant's record of what was approved
     # today (witness.approval_record). Asked for once, and only when an order
     # has cleared everything else and is about to go live; a test hands one in.
+    # plan_only never asks: nothing it does can place an order.
+    binding = None if plan_only else {"record": approval}
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
@@ -1045,21 +1071,8 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                 # A guard that cannot be evaluated is not a guard that passed.
                 extra = ["per-symbol guards unavailable (%s)" % type(e).__name__]
         bad = preconditions(cfg, st, {}, o, sealed_ok,
-                            list(guard_blocks) + extra if extra else guard_blocks)
-        # H8: THE APPROVAL BINDS THE ORDER. The gate inside preconditions
-        # asked whether today is approved; this asks whether THIS order is one
-        # the approved plan proposed. Only where the plan gate is on -- and an
-        # armed cycle cannot have it off (H6). Never when plan_only.
-        if not bad and not plan_only and cfg.get("daily_plan_required", True):
-            if _guards is None:
-                bad = ["guards.py unavailable -- the order cannot be matched to an approval"]
-            else:
-                if approval is None:
-                    try:
-                        approval = witness.approval_record(cfg=cfg)
-                    except Exception as e:                        # noqa: BLE001
-                        approval = {"ok": False, "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
-                bad = list(_guards.approval_reasons(o, approval, st.get("orders_today")))
+                            list(guard_blocks) + extra if extra else guard_blocks,
+                            approval=binding)
         v = venue_for(o, live_venues)
         if v is None:
             results.append({**o, "status": "NO VENUE",
