@@ -199,6 +199,11 @@ class _Stub:
     name = "stub"
     def __init__(self, behaviour): self.b = behaviour
     def has_credentials(self): return True
+    # H9 (2026-11-12): before a live order the trader asks the venue what its
+    # key may do (key_scope.key_reasons) and refuses a venue that cannot say.
+    # This stand-in answers as a trade-only key would. See test_h09_venue_keys.py.
+    def key_permissions(self, fetch=None):
+        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "stand-in"}
     def place(self, sym, side, qty, live=False, **kw):
         if isinstance(self.b, Exception):
             raise self.b

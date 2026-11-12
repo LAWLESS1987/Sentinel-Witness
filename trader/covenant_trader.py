@@ -77,6 +77,7 @@ sys.path.insert(0, HERE)
 import daily                      # prices, 200d regime, cross-venue verification
 import signal_ledger              # Rule 5: seals regime calls, scores them on flips
 import venues as V
+import key_scope                  # H9: what a venue's key may do; judged, never fetched, there
 import witness                    # covenant: the seal, the day's approval, the floors
 
 try:
@@ -953,7 +954,8 @@ def plan(cfg, pf, week_spent=0.0):
 
 
 # ------------------------------------------------------------------ execution
-def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None):
+def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None,
+                  venue=None, key_cache=None):
     """Every reason this specific order may not go live. Empty list = clear.
 
     ONE IMPLEMENTATION SINCE 2026-09-07. The rule moved to guards.py so that
@@ -996,6 +998,17 @@ def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None):
                                       "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
         bad = list(_guards.approval_reasons(order, approval["record"],
                                             st.get("orders_today") if isinstance(st, dict) else None))
+    # H9 (2026-11-12): WHAT THE VENUE'S KEY MAY DO. Asked last, once per venue
+    # per cycle, and only for an order that has cleared everything else: the
+    # key must be able to trade and unable to move funds out, and an answer
+    # that cannot be read refuses (key_scope.key_reasons). `venue` is None for
+    # a caller that is not about to place anything.
+    if not bad and venue is not None:
+        cache = key_cache if key_cache is not None else {}
+        name = getattr(venue, "name", "?")
+        if name not in cache:
+            cache[name] = list(key_scope.key_reasons(venue))
+        bad = list(cache[name])
     return bad
 
 
@@ -1051,6 +1064,7 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     # has cleared everything else and is about to go live; a test hands one in.
     # plan_only never asks: nothing it does can place an order.
     binding = None if plan_only else {"record": approval}
+    key_cache = {}                # H9: each venue's key is asked about once per cycle
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
@@ -1070,10 +1084,13 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             except Exception as e:                            # noqa: BLE001
                 # A guard that cannot be evaluated is not a guard that passed.
                 extra = ["per-symbol guards unavailable (%s)" % type(e).__name__]
+        # H9: the venue is chosen BEFORE the question is asked, because one of
+        # the things that must say yes is that venue's key.
+        v = venue_for(o, live_venues)
         bad = preconditions(cfg, st, {}, o, sealed_ok,
                             list(guard_blocks) + extra if extra else guard_blocks,
-                            approval=binding)
-        v = venue_for(o, live_venues)
+                            approval=binding,
+                            venue=None if plan_only else v, key_cache=key_cache)
         if v is None:
             results.append({**o, "status": "NO VENUE",
                             "detail": "no credentialed venue holds it"})

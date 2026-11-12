@@ -28,11 +28,40 @@ CREDENTIALS
 from __future__ import annotations
 import os, json, time, base64, hashlib, hmac, urllib.request, urllib.parse, urllib.error, secrets
 
+import key_scope          # H9: what a key may do, and who else can read it. No network code.
+
 HOME = os.path.expanduser("~")
 
 
 class VenueError(Exception):
     """Anything the venue refused or could not answer. Always carries the why."""
+
+
+# H9 (2026-11-12). Two things every adapter below now does, both judged in
+# key_scope.py (which makes no venue call) and both said here in VenueError's
+# words so every existing caller handles them as it handles any venue failure:
+#
+#   _own_credential(path)   before a credential file is read: refuse one that
+#                           another account on this machine can read. Windows
+#                           is asked through the file's ACL, not its mode bits.
+#   key_permissions(fetch)  what the installed key may do, from the venue's own
+#                           endpoint where it has one. `fetch` is the function
+#                           that returns the venue's raw answer; the default
+#                           makes the signed call, a test hands in a fake.
+#                           covenant_trader asks key_scope.key_reasons(venue)
+#                           before any live order.
+def _own_credential(path):
+    try:
+        key_scope.refuse_shared_credential(path)
+    except key_scope.KeyScopeError as e:
+        raise VenueError(str(e)) from None
+
+
+def _scope(fn, *a):
+    try:
+        return fn(*a)
+    except key_scope.KeyScopeError as e:
+        raise VenueError(str(e)) from None
 
 
 # --------------------------------------------------------------------- shared
@@ -109,6 +138,7 @@ class KrakenVenue:
         here = os.path.dirname(os.path.abspath(__file__))
         if os.path.realpath(self.CRED).startswith(os.path.realpath(here) + os.sep):
             raise VenueError("credential is inside the synced folder -- refusing")
+        _own_credential(self.CRED)                               # H9
         k = s = ""
         for line in open(self.CRED, encoding="utf-8"):
             line = line.strip()
@@ -197,6 +227,14 @@ class KrakenVenue:
     def open_orders(self):
         return self._private("OpenOrders").get("open", {})
 
+    # -- what this key may do (H9) -------------------------------------------
+    KEY_SCOPE_ENDPOINT = "POST /0/private/GetApiKeyInfo"
+
+    def key_permissions(self, fetch=None):
+        """`fetch` returns GetApiKeyInfo's `result` object."""
+        return _scope(key_scope.from_kraken,
+                      (fetch or (lambda: self._private("GetApiKeyInfo")))())
+
     # -- orders -------------------------------------------------------------
     def place(self, symbol, side, qty, live=False, ordertype="market", price=None):
         """side is 'buy'/'sell'. Returns a dict describing what happened.
@@ -269,6 +307,7 @@ class CoinbaseVenue:
             return self._cred
         j = os.path.join(self.CRED_DIR, "cdp_api_key.json")
         if os.path.exists(j):
+            _own_credential(j)                                   # H9
             d = json.load(open(j, encoding="utf-8"))
             name, pk = d.get("name") or d.get("id"), d.get("privateKey")
         else:
@@ -276,6 +315,7 @@ class CoinbaseVenue:
             if not os.path.exists(p):
                 raise VenueError(f"no CDP credential in {self.CRED_DIR} "
                                  f"(see EXCHANGE_SETUP.md)")
+            _own_credential(p)                                   # H9
             name = pk = None
             for line in open(p, encoding="utf-8"):
                 line = line.strip()
@@ -376,6 +416,14 @@ class CoinbaseVenue:
     def open_orders(self):
         js = self._call("GET", "/api/v3/brokerage/orders/historical/batch?order_status=OPEN")
         return js.get("orders", [])
+
+    # -- what this key may do (H9) -------------------------------------------
+    KEY_SCOPE_ENDPOINT = "GET /api/v3/brokerage/key_permissions"
+
+    def key_permissions(self, fetch=None):
+        """`fetch` returns the key_permissions JSON object."""
+        return _scope(key_scope.from_coinbase,
+                      (fetch or (lambda: self._call("GET", "/api/v3/brokerage/key_permissions")))())
 
     def fees(self):
         """Maker/taker rates for the account's current tier (Advanced Trade
@@ -541,6 +589,7 @@ class RobinhoodVenue:
                 f"no credential at {self.CRED} (see EXCHANGE_SETUP.md). "
                 f"Robinhood requires auth even for market data, so nothing "
                 f"on this venue answers read-only without a key.")
+        _own_credential(self.CRED)                               # H9
         try:
             with open(self.CRED, encoding="utf-8") as fh:
                 raw = json.load(fh)
@@ -584,6 +633,19 @@ class RobinhoodVenue:
                              f"{detail}")
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise VenueError(f"robinhood {method} {path}: {e}")
+
+    # -- what this key may do (H9) -------------------------------------------
+    # This venue publishes no endpoint that reports a key's permissions, so it
+    # cannot be asked. The answer is the operator's own hand-written record
+    # (key_scope.KEY_SCOPE_FILE); with none, no live order goes to this venue.
+    KEY_SCOPE_ENDPOINT = None
+
+    def key_permissions(self, fetch=None):
+        """`fetch` returns the record's three answers; the default reads the
+        operator's file."""
+        if fetch is not None:
+            return fetch()
+        return _scope(key_scope.recorded, self.name)
 
     def meta(self, symbol):
         sym = f"{symbol.upper()}-USD"
