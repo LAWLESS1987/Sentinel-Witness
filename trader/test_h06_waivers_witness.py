@@ -337,6 +337,27 @@ finally:
     W.daily_plan_gate_reasons = keep_gate
 check("F2 ...and the same file without the waiver, naming the pinned folder, clears", rs == [], rs)
 
+# ---- G: plan() reads the floor file witness_ready checked (H6b) ----------------------------
+# ADDED after an end-to-end rehearsal of this pass. witness_ready() checks
+# RESERVE_PATH as it is when the cycle runs; plan() called reserve_baseline(pf)
+# with no path, whose default is RESERVE_PATH as it was when the module was
+# loaded. The same object in a real run -- but two readings of one name, and
+# when they were made to differ the cycle passed the check on one file and
+# read, and created, floors at the other.
+seen = []
+keep_rb, keep_rp = T.reserve_baseline, T.RESERVE_PATH
+try:
+    T.RESERVE_PATH = RP
+    T.reserve_baseline = lambda pf, path=None: seen.append(path) or ({"XLM": 100.0}, {"XLM": 100.0}, [])
+    T.plan({"max_position_pct": 0.20, "min_cash_pct": 0.10, "max_order_usd": 25.0, "min_order_usd": 5.0,
+            "max_orders_per_day": 2},
+           {"positions": [{"sym": "XLM", "qty": 100.0, "px": 1.0, "val": 100.0, "regime": "UP", "at": {"f": 1.0}}],
+            "cash": 900.0, "total": 1000.0, "unpriced": [], "venue_notes": []})
+finally:
+    T.reserve_baseline, T.RESERVE_PATH = keep_rb, keep_rp
+check("G1 plan() hands reserve_baseline the RESERVE_PATH of NOW -- the one witness_ready checked -- "
+      "not the default bound when the module was loaded", seen == [RP], seen)
+
 W.PINNED_COVENANT_HOME, W.PIN_FILE = KEEP_PIN
 n = len(results)
 print(f"\nH6 waivers and witness: {sum(results)}/{n} passed")

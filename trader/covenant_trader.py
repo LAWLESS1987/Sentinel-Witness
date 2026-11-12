@@ -797,7 +797,16 @@ def plan(cfg, pf, week_spent=0.0):
     # so a reserve enforced there would never run. It is enforced HERE, on the
     # quantity itself, before an order exists.
     try:
-        base, held_now, raised = reserve_baseline(pf)
+        # H6b (2026-11-12): THE PATH IS READ NOW, NOT AT IMPORT. This was
+        # reserve_baseline(pf), whose default argument is the RESERVE_PATH of
+        # the moment the module was loaded -- while witness_ready() checks the
+        # RESERVE_PATH of the moment it is called. They are the same object in
+        # a real run. Found by an end-to-end rehearsal that moved one and not
+        # the other: the cycle passed witness_ready on the pinned folder's
+        # floor file and then read (and, finding none, CREATED) floors at the
+        # other path. The floor file plan() reads is now the one that was
+        # checked.
+        base, held_now, raised = reserve_baseline(pf, RESERVE_PATH)
     except ReserveUnreadable as e:
         # FAIL CLOSED, and it costs nothing to do so. Every order this
         # function can produce is a SELL, so refusing to plan is precisely the
