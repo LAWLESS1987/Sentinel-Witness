@@ -231,8 +231,12 @@ for k, o in {"NaN qty": dict(base, qty=NAN), "NaN usd": dict(base, usd=NAN),
 check("E1 a malformed order (NaN/zero/inf quantity, NaN/negative dollars, side 'BUY', no symbol) "
       "is REFUSED with its reason and reaches NO venue call, not even a dry run", not let, let)
 res, fv, st = run_execute(dict(base))
+# R2 (2026-11-12): the size SENT is the declared dollars over (reference x 1.01),
+# so that the most the order can move inside its price band is what it
+# declared -- 19.80 units for $20 at $1.00, where this used to expect 20.0.
 check("E1b ...and a well-formed one does reach the venue's dry run (disarmed: live=False)",
-      fv.calls == [("XLM", "sell", 20.0, False)] and res[0]["status"] == "VALIDATED",
+      len(fv.calls) == 1 and fv.calls[0][:2] == ("XLM", "sell") and fv.calls[0][3] is False
+      and abs(fv.calls[0][2] - 20.0 / 1.01) < 1e-9 and res[0]["status"] == "VALIDATED",
       (fv.calls, res))
 
 

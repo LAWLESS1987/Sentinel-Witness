@@ -1160,6 +1160,19 @@ def _malformed_order(o):
                 or x in (float("inf"), float("-inf")) or x <= 0):
             return ("order %s is not a finite number above zero (got %r) -- refusing"
                     % (label, x))
+    # R2 (2026-11-12): BASE AND QUOTE MUST AGREE. `qty` is units of the coin,
+    # `usd` is dollars, and where the order carries its own price the two must
+    # say the same thing: qty x px within the final-order tolerance of usd. An
+    # order built with dollars in the quantity field (25 "units" of a $2,000
+    # coin, $25 declared) is the mistake this catches, before any venue is
+    # called.
+    px = o.get("px")
+    if isinstance(px, (int, float)) and not isinstance(px, bool) and px == px and 0 < px < float("inf"):
+        worth = float(o["qty"]) * float(px)
+        if abs(worth - float(o["usd"])) > V.FINAL_TOLERANCE * float(o["usd"]):
+            return ("order quantity and dollars disagree: %.10g units at its own price %.10g is "
+                    "$%.2f, and it declares $%.2f -- units of the coin and dollars may have "
+                    "been confused; refusing" % (o["qty"], px, worth, o["usd"]))
     return None
 
 
@@ -1266,6 +1279,15 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                   if isinstance(r_, dict) and r_.get("sym") == o["sym"] and r_.get("side") == o.get("side"))
         cref = V.client_ref(st.get("day") or time.strftime("%Y-%m-%d"), o["sym"], o["side"],
                             "%.8f" % float(o["qty"]), seq)
+        # R2 (2026-11-12): THE SIZE THAT IS SENT. The limit sits a band away
+        # from the reference, so the declared quantity at that limit could
+        # move more than the declared dollars. The quantity is cut so that the
+        # MOST the order can move inside the band is the declared dollars:
+        # declared / (reference x (1 + band)), about 1% under the plan's own
+        # quantity, and never above it. The adapter then rounds DOWN to the
+        # venue's increment and checks the result (venues.final_order). The
+        # day's record keeps the declared dollars, which the order cannot exceed.
+        qty_send = min(float(o["qty"]), float(o["usd"]) / (ref_px * (1.0 + V.PRICE_BAND)))
         if go_live:
             # THE FIAT PORTION IS MEASURED FIRST, from the day's sale headroom
             # before this order exists in orders_today -- appending first would
@@ -1295,11 +1317,12 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                        "at": time.time(), "txid": None, "status": "PENDING",
                        # H10: where it went, the reference it carries, and that
                        # nothing has confirmed it filled yet.
-                       "venue": v.name, "client_ref": cref, "fill": "UNCONFIRMED"}
+                       "venue": v.name, "client_ref": cref, "fill": "UNCONFIRMED",
+                       "qty": qty_send}                       # R2: the size that was sent
             st.setdefault("orders_today", []).append(pending)
             save_state(st)
         try:
-            r = v.place(o["sym"], o["side"], o["qty"], live=go_live,
+            r = v.place(o["sym"], o["side"], qty_send, live=go_live,
                         **_place_kwargs(v, ref_px=ref_px, client_ref=cref,
                                         permit=permit, declared_usd=float(o["usd"])))
             results.append({**o, "status": "PLACED" if go_live else "VALIDATED",

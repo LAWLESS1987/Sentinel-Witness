@@ -125,6 +125,80 @@ def _iso_epoch(s):
         return None
 
 
+# R2 (2026-11-12): THE CAPS ARE CHECKED ON THE ORDER THAT IS ACTUALLY SENT.
+# Review round one, confirmed by the outside reviewer. Every cap, the day's
+# remaining notional and the approval were checked against the order's
+# DECLARED dollars -- the planner's `usd`. What a venue received was a
+# QUANTITY, then rounded to the venue's increment and given a limit price a
+# band away from the reference; nothing compared the result with the dollars
+# that had been approved. A $25 purchase with a ceiling 1% above the
+# reference can spend $25.25. A quantity that was really a dollar figure --
+# 25 "units" of a $2,000 coin -- was a $50,000 order with $25 declared.
+#
+# final_order() is the one reading, made by each adapter on the size and
+# price it is about to send, in BASE units and QUOTE dollars kept apart:
+#
+#   at_ref    size x reference price          what the order is
+#   at_limit  size x limit price              what it books at its own limit
+#   worst     the most dollars it can move inside the band:
+#               a purchase  size x limit      (it cannot fill above its limit)
+#               a sale      size x the higher of its limit and
+#                           reference x (1 + PRICE_BAND)
+#
+# `worst` may not exceed the declared dollars -- and the declared dollars have
+# already been held to the per-order ceiling, the day's remaining notional and
+# the approved order by guards.live_gate, so nothing sent can exceed any of
+# them. `at_ref` may be at most FINAL_TOLERANCE under the declared dollars: an
+# order rounded or resized further than that is not the order that was
+# approved, and is refused rather than sent. covenant_trader sizes the
+# quantity as declared / (reference x (1 + PRICE_BAND)) so that an ordinary
+# order passes with about 1% to spare.
+FINAL_TOLERANCE = 0.02
+
+
+def final_order(side, size, limit_price, ref_px, declared_usd, what="order"):
+    """{"at_ref", "at_limit", "worst"} for the order as it will be sent, or
+    VenueRefused. `size` is in BASE units; the three results are in QUOTE
+    dollars."""
+    try:
+        size, limit, ref, declared = float(size), float(limit_price), float(ref_px), float(declared_usd)
+    except (TypeError, ValueError):
+        raise VenueRefused(f"{what}: the final size, price, reference or declared dollars is not "
+                           f"a number -- nothing was sent") from None
+    for label, x in (("size", size), ("limit price", limit), ("reference price", ref),
+                     ("declared dollars", declared)):
+        if not (x == x and 0 < x < float("inf")):
+            raise VenueRefused(f"{what}: the {label} is {x!r}, not a finite number above zero "
+                               f"-- nothing was sent")
+    at_ref, at_limit = size * ref, size * limit
+    worst = at_limit if str(side).lower() == "buy" else size * max(limit, ref * (1.0 + PRICE_BAND))
+    if worst > declared * (1.0 + 1e-9):
+        hint = (" The size is in units of the coin, not in dollars: if a dollar amount was "
+                "passed as the size, this is that mistake." if at_ref > 3.0 * declared else "")
+        raise VenueRefused(f"{what}: as it would be sent ({size:.10g} units, limit {limit:.10g}) it "
+                           f"could move ${worst:,.2f}, more than the ${declared:,.2f} declared -- "
+                           f"nothing was sent.{hint}")
+    if at_ref < declared * (1.0 - FINAL_TOLERANCE) - 1e-9:
+        raise VenueRefused(f"{what}: as it would be sent ({size:.10g} units) it is worth "
+                           f"${at_ref:,.2f} at the reference price, more than "
+                           f"{FINAL_TOLERANCE:.0%} under the ${declared:,.2f} declared -- that is "
+                           f"not the order that was approved; nothing was sent")
+    return {"at_ref": at_ref, "at_limit": at_limit, "worst": worst}
+
+
+def _final_or_refuse(live, side, size, limit_price, ref_px, declared_usd, what):
+    """Run final_order when there is something to check it against. A LIVE
+    order always has: it does not go without a reference price, a limit and
+    the dollars the gate permitted."""
+    if ref_px is not None and declared_usd is not None and limit_price is not None:
+        return final_order(side, size, limit_price, ref_px, declared_usd, what)
+    if live:
+        raise VenueRefused(f"{what}: a live order needs a reference price, a limit price and the "
+                           f"declared dollars, so that what is sent can be checked against what "
+                           f"was approved -- nothing was sent")
+    return None
+
+
 # R1 (2026-11-12): A LIVE ORDER NEEDS A PERMIT THE GATE RECORDED. Every
 # place() below took `live=True` from whoever called it, and that was the
 # whole of the decision at this layer. Now a live order is sent only against
@@ -411,6 +485,15 @@ class KrakenVenue:
                 data["price"] = f"{_round_down(price, m['pair_decimals']):.{m['pair_decimals']}f}"
             if tif:
                 data["timeinforce"] = tif
+        # R2: the order as it will be sent -- the volume AFTER rounding to the
+        # lot (down, never up to a minimum), at the price AFTER rounding to the
+        # grid. `volume` is in the base coin: no `viqc` flag is ever set.
+        final = _final_or_refuse(live, side, vol, data.get("price"), ref_px, declared_usd,
+                                 f"kraken {side} {symbol}")
+        cost = vol * float(data["price"]) if data.get("price") else None
+        if m.get("costmin") and cost is not None and cost < m["costmin"]:
+            raise VenueRefused(f"{symbol}: ${cost:.2f} is below Kraken's minimum order cost "
+                               f"${m['costmin']} -- refused, not raised to it")
         if not live:
             data["validate"] = "true"
         elif client_ref:
@@ -424,7 +507,7 @@ class KrakenVenue:
         if isinstance(txid, list):                  # Kraken returns a list of ids
             txid = txid[0] if len(txid) == 1 else (",".join(str(x) for x in txid) or None)
         return {"venue": self.name, "live": live, "symbol": symbol, "side": side,
-                "qty": vol, "pair": m["pair"], "ordertype": ordertype,
+                "qty": vol, "pair": m["pair"], "ordertype": ordertype, "final": final,
                 "price": data.get("price"), "client_ref": data.get("cl_ord_id"),
                 "descr": (res.get("descr") or {}).get("order"),
                 "txid": txid}
@@ -791,6 +874,11 @@ class CoinbaseVenue:
             end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + self.MAKER_TTL_S))
             cfg = {"limit_limit_gtd": {"base_size": size_s, "limit_price": price,
                                        "end_time": end, "post_only": True}}
+        # R2: the order as it will be sent -- base_size AFTER snapping to the
+        # base increment (down), at the limit AFTER snapping to the quote grid.
+        # The size is always base_size; quote_size is never sent.
+        final = _final_or_refuse(live, side, size, None if ordertype == "market" else price,
+                                 ref_px, declared_usd, f"coinbase {side} {symbol}")
         body = {"product_id": m["product_id"], "side": side.upper(),
                 "order_configuration": cfg}
         # /preview parses and prices the order without booking it -- Coinbase's
@@ -822,7 +910,7 @@ class CoinbaseVenue:
         if not live and res.get("errs"):
             raise VenueError(f"coinbase preview rejected: {json.dumps(res['errs'])[:300]}")
         return {"venue": self.name, "live": live, "symbol": symbol, "side": side,
-                "qty": size, "product": m["product_id"],
+                "qty": size, "product": m["product_id"], "final": final,
                 "descr": json.dumps(res.get("order_configuration") or cfg)[:120],
                 "txid": ((res.get("success_response") or {}).get("order_id")
                          if live else None)}
@@ -1010,6 +1098,15 @@ class RobinhoodVenue:
         if m["ordermin"] and size < m["ordermin"]:
             raise VenueRefused(f"robinhood: {size} {symbol} is under the "
                                f"minimum order size {m['ordermin']}")
+        # R2: the order as it will be sent. asset_quantity is in the base coin;
+        # quote_amount is never sent.
+        limit_s = None
+        if ref_px is not None:
+            inc = str(m.get("increment") or "0.01")
+            decimals = max(0, len(inc.split(".")[1].rstrip("0")) if "." in inc else 0)
+            limit_s = _grid(band_edge(side, ref_px), decimals, side)
+        final = _final_or_refuse(live, side, size, limit_s, ref_px, declared_usd,
+                                 f"robinhood {side} {symbol}")
         if not live:
             # LOCAL ONLY -- see the class docstring. There is no venue-side
             # preview to call, so this reports what was checked HERE and
@@ -1040,11 +1137,9 @@ class RobinhoodVenue:
         except ValueError:
             coid = str(uuid.uuid5(uuid.NAMESPACE_OID, ref))
         config = {"asset_quantity": str(size)}
-        if ref_px is not None:
+        if limit_s is not None:
             ordertype = "limit"
-            inc = str(m.get("increment") or "0.01")
-            decimals = max(0, len(inc.split(".")[1].rstrip("0")) if "." in inc else 0)
-            config["limit_price"] = _grid(band_edge(side, ref_px), decimals, side)
+            config["limit_price"] = limit_s
         body = {"symbol": m["pair"], "client_order_id": coid,
                 "side": side.lower(), "type": ordertype,
                 f"{ordertype}_order_config": config}

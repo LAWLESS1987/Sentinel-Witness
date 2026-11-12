@@ -217,6 +217,13 @@ check("E9 ...and any other 4xx still frees it, as before", st["orders_today"] ==
 # ---- B: the band -----------------------------------------------------------------------------
 BAND = getattr(V, "PRICE_BAND", None)
 check("B0 the band is 1% of the reference price", BAND == 0.01, BAND)
+# R2 (2026-11-12): what an adapter is handed is the size covenant_trader cuts
+# the order to -- declared dollars over (reference x 1.01) -- so that the most
+# it can move inside the band is what was declared. $20 at a $2.00 reference
+# is 9.90 units; the 10.0 these calls used could move $20.20 and is refused.
+SIZE = 20.0 / (2.0 * 1.01)
+
+
 def permit(venue, sym, side, usd):
     """A permit as guards.live_gate records one, for driving a real adapter's
     live path over a stubbed transport. (The gate itself is test_r01's.)"""
@@ -224,7 +231,7 @@ def permit(venue, sym, side, usd):
 
 
 k = Kraken()
-k.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("kraken", "XLM", "sell", 20.0))
+k.place("XLM", "sell", SIZE, live=True, ref_px=2.0, client_ref=a, permit=permit("kraken", "XLM", "sell", 20.0))
 ep, d = k.sent[-1]
 check("B1 Kraken, with a reference price: a LIMIT, immediate-or-cancel, at the band's edge "
       "($1.98 for a sale against $2.00) -- not a market order",
@@ -259,21 +266,21 @@ class Coinbase(V.CoinbaseVenue):
 
 
 c = Coinbase(1.9990, 2.0010)
-r = c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
+r = c.place("XLM", "sell", SIZE, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
 check("B2 Coinbase, touch inside the band: the post-only limit is sent, with the caller's "
       "reference as client_order_id", len(c.sent) == 1 and c.sent[0][1]["client_order_id"] == a
       and "limit_limit_gtd" in c.sent[0][1]["order_configuration"], c.sent)
 c = Coinbase(1.90, 1.91)                              # the market has dropped 4.5% since the plan was priced
 got = None
 try:
-    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
+    c.place("XLM", "sell", SIZE, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
 except Exception as e:                                           # noqa: BLE001
     got = e
 check("B3 Coinbase, touch OUTSIDE the band (ask $1.91 against a $2.00 reference): refused before "
       "anything is sent", isinstance(got, Refused) and c.sent == [] and "band" in str(got), (got, c.sent))
 got = None
 try:
-    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, ordertype="market",
+    c.place("XLM", "sell", SIZE, live=True, ref_px=2.0, ordertype="market",
             permit=permit("coinbase", "XLM", "sell", 20.0))
 except Exception as e:                                           # noqa: BLE001
     got = e
@@ -295,8 +302,8 @@ class Robin(V.RobinhoodVenue):
 
 
 rb = Robin()
-rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
-rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
+rb.place("XLM", "sell", SIZE, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
+rb.place("XLM", "sell", SIZE, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
 b1, b2 = rb.sent[0][2], rb.sent[1][2]
 check("B5 Robinhood, with a reference price: a LIMIT at the band's edge, not a market order",
       b1.get("type") == "limit" and abs(float(b1["limit_order_config"]["limit_price"]) - 1.98) < 1e-9, b1)

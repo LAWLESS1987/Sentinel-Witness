@@ -84,13 +84,17 @@ check("market_market_ioc" in v.sent[-1][1]["order_configuration"],
 # sends nothing -- test_r01_live_gate.py G1-G6. L1 is about the ORDER BODY a
 # live call builds (its client_order_id), so the permit check is replaced here
 # and restored after it.
+# R2 (2026-11-12): and a live order is not sent without a reference price and
+# the declared dollars, so that what is sent can be checked against what was
+# approved. The stand-in permit declares $6.19 and the calls carry the touch
+# as their reference (0.5 LINK at a $12.253 limit is $6.13).
 _real_permit = V._live_permit
-V._live_permit = lambda permit, venue_name, symbol, side: None
-r1 = v.place("LINK", "buy", 0.5, live=True, day="2026-09-06")
+V._live_permit = lambda permit, venue_name, symbol, side: 6.19
+r1 = v.place("LINK", "buy", 0.5, live=True, day="2026-09-06", ref_px=12.2534)
 id1 = v.sent[-1][1]["client_order_id"]
-r2 = v.place("LINK", "buy", 0.5, live=True, day="2026-09-06")
+r2 = v.place("LINK", "buy", 0.5, live=True, day="2026-09-06", ref_px=12.2534)
 id2 = v.sent[-1][1]["client_order_id"]
-v.place("LINK", "buy", 0.5, live=True, day="2026-09-07")
+v.place("LINK", "buy", 0.5, live=True, day="2026-09-07", ref_px=12.2534)
 id3 = v.sent[-1][1]["client_order_id"]
 V._live_permit = _real_permit
 check(v.sent[-1][0].endswith("/orders") and id1 == id2 and id1 != id3 and r1["txid"] == "oid-1",
