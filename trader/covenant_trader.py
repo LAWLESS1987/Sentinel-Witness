@@ -133,13 +133,99 @@ def load_config():
     return cfg
 
 
-def load_state():
+class StateUnreadable(Exception):
+    """The state file exists and cannot be read, parsed or made sense of. H2.
+
+    UNKNOWN IS NOT ABSENT -- the doctrine ReserveUnreadable below already
+    states for the floor file, and guards.load_trader_state for this one. This
+    file's own reader did not follow it: it caught every exception and answered
+    with the defaults, so a state that could not be read came back as "no
+    orders today, nothing ever bought, no equity peak", and the save at the end
+    of the cycle wrote that over the real record."""
+
+
+def _fresh_state():
+    return {"orders_today": [], "day": "", "equity_peak": 0.0,
+            "equity_start_of_day": 0.0, "closed_trades": [], "last_sold": {},
+            "sealed_signals": 0, "bought_total_usd": 0.0}
+
+
+def _reject_constant(name):
+    raise ValueError("the state holds %s, which is not a number" % name)
+
+
+_STATE_SHAPE = (("orders_today", list), ("closed_trades", list), ("fiat_buys", list),
+                ("last_sold", dict), ("rule5", dict), ("day", str))
+_STATE_NUMBERS = ("equity_peak", "equity_start_of_day", "bought_total_usd", "sealed_signals")
+
+
+def _state_problem(st):
+    """Why this parsed state cannot be used, or None. Containers must be the
+    containers the guards read and the running totals finite numbers at or
+    above zero; a row inside a list is the guards' to judge (H1), not this."""
+    if not isinstance(st, dict):
+        return "it holds a %s, not an object" % type(st).__name__
+    for key, kind in _STATE_SHAPE:
+        if key in st and not isinstance(st[key], kind):
+            return "%r is a %s, not a %s" % (key, type(st[key]).__name__, kind.__name__)
+    for key in _STATE_NUMBERS:
+        if key in st:
+            v = st[key]
+            if (isinstance(v, bool) or not isinstance(v, (int, float)) or v != v
+                    or v in (float("inf"), float("-inf")) or v < 0):
+                return "%r is %r, not a finite number at or above zero" % (key, v)
+    return None
+
+
+def _read_state_file(path):
+    """The state at `path`, or None when there is no file. Raises
+    StateUnreadable for a file that is there and cannot be used."""
+    if not os.path.lexists(path):
+        return None
     try:
-        return json.load(open(STATE, encoding="utf-8"))
-    except Exception:
-        return {"orders_today": [], "day": "", "equity_peak": 0.0,
-                "equity_start_of_day": 0.0, "closed_trades": [], "last_sold": {},
-                "sealed_signals": 0, "bought_total_usd": 0.0}
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        st = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (OSError, ValueError) as e:
+        raise StateUnreadable("%s: %s" % (type(e).__name__, str(e)[:120])) from e
+    why = _state_problem(st)
+    if why:
+        raise StateUnreadable(why)
+    return st
+
+
+def load_state():
+    """The trader's state. A MISSING file is a known empty state (the trader
+    has never run). A file that EXISTS and cannot be read, parsed or made sense
+    of raises StateUnreadable -- H2 (2026-11-12). run_once refuses the cycle on
+    it, and save_state refuses to write over it."""
+    st = _read_state_file(STATE)
+    return _fresh_state() if st is None else st
+
+
+def set_state_aside(path=None):
+    """Keep a byte-for-byte COPY of an unreadable state beside it, and leave
+    the original exactly where and as it is. Returns the copy's path, or None.
+
+    The original is NOT moved. Moving it would leave no file, and no file reads
+    as "the trader has never run" -- the zeroed day count, lifetime buy total
+    and equity peak this change exists to stop. So the unreadable file stays in
+    place and every later cycle refuses on it until an operator repairs or
+    removes it; the copy is there so that repair cannot lose the evidence.
+    Named by the content's SHA-256, so the same bytes are copied once."""
+    p = path or STATE
+    try:
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        aside = "%s.unreadable-%s" % (p, hashlib.sha256(raw).hexdigest()[:16])
+        if not os.path.exists(aside):
+            with open(aside, "xb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+        return aside
+    except OSError:
+        return None
 
 
 def save_state(st):
@@ -156,6 +242,11 @@ def save_state(st):
     than relying on the last check in the chain.
     """
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    # H2 (2026-11-12): NEVER WRITE OVER A RECORD THAT COULD NOT BE READ. The
+    # file on disk is read again here, at the last moment, whatever the caller
+    # believes about it: if it is there and unreadable this raises, and the
+    # unreadable bytes stay as they are.
+    _read_state_file(STATE)
     import durable
     durable.write_json(STATE, st, indent=2)
 
@@ -975,6 +1066,7 @@ def hr(t):
 
 
 LAST_SEAL_OK = True   # set by run_once; main() turns a failed required seal into exit 3 so the scheduler sees it
+LAST_REFUSAL = None   # H2: set by run_once when the cycle was refused before it began; main() exits 4 on it
 
 
 def witness_ready(cfg, reserve=None):
@@ -1004,13 +1096,31 @@ def witness_ready(cfg, reserve=None):
 
 
 def run_once(cfg, plan_only=False):
+    global LAST_REFUSAL
+    LAST_REFUSAL = None
     why = witness_ready(cfg)
     if why:
         hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
         print("  " + why)
         print("  Nothing was read, planned, sealed or sent.")
         return
-    st = roll_day(load_state())
+    try:
+        st = load_state()
+    except StateUnreadable as e:
+        # H2: stop here, with the reason, having written nothing.
+        aside = set_state_aside()
+        LAST_REFUSAL = ("trader state exists but cannot be read (%s) -- the day's order "
+                        "count, the lifetime buy total and the equity peak are UNKNOWN, "
+                        "and unknown is not zero" % e)
+        hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
+        print("  " + LAST_REFUSAL)
+        print("  state file : %s  (left exactly as it is; it was NOT overwritten)" % STATE)
+        print("  copy kept  : %s" % (aside or "COULD NOT BE WRITTEN -- copy the file by hand before repairing it"))
+        print("  Repair or restore the state file, or remove it only if you know this")
+        print("  trader has placed nothing today and bought nothing ever.")
+        print("  Nothing was read from a venue, planned, sealed or sent.")
+        return
+    st = roll_day(st)
 
     hr(f"COVENANT TRADER   {time.strftime('%Y-%m-%d %H:%M')}"
        + ("   [ARMED]" if cfg.get("armed") else "   [disarmed]"))
@@ -1224,7 +1334,14 @@ def run_once(cfg, plan_only=False):
 
 
 def cmd_status(cfg):
-    st = roll_day(load_state())
+    state_note = None
+    try:
+        st = roll_day(load_state())
+    except StateUnreadable as e:
+        # H2: status still prints; it says the state is unknown and shows no
+        # count as though it were known.
+        state_note = "UNREADABLE (%s) -- no cycle will run until it is repaired" % e
+        st = {}
     hr("STATUS")
     print(f"  armed              : {cfg.get('armed')}")
     print(f"  halt file present  : {os.path.exists(HALT)}  ({os.path.basename(HALT)})")
@@ -1248,7 +1365,7 @@ def cmd_status(cfg):
     print(f"  R6 contribution    : {'ON' if cfg.get('allow_fiat_buys') and float(cfg.get('weekly_fiat_budget_usd') or 0) > 0 else 'off'}"
           f" -- ${wk:,.2f} of ${float(cfg.get('weekly_fiat_budget_usd') or 0):,.2f} used this week")
     print(f"  XRPL record        : {'on (' + str(cfg.get('xrpl_network')) + ')' if cfg.get('xrpl_record') else 'off'}")
-    print(f"  state file         : {STATE}")
+    print(f"  state file         : {STATE}" + (f"  {state_note}" if state_note else ""))
     for v in V.all_venues():
         print(f"  {v.name:<18} : credential {'installed' if v.has_credentials() else 'MISSING'}")
     for n in node_status(cfg.get("node_ports") or []):
@@ -1303,6 +1420,11 @@ def main():
     # DID complete; refusing is the gate working. What must never print it is a
     # crash, and a crash cannot: run_once raises straight past this line.
     print("---- CYCLE COMPLETE %s ----" % datetime.date.today().strftime("%m/%d/%Y"))
+    if LAST_REFUSAL:
+        # H2: a cycle refused because the trader's own record is unreadable is
+        # not a clean run, and the scheduler's Last Result should say so.
+        print("  exit 4: the cycle was refused before it began -- " + LAST_REFUSAL[:160])
+        return 4
     if not LAST_SEAL_OK:
         # A required seal that failed used to leave Last Result 0 in the
         # scheduler and be visible only in trader_log.txt (2026-09-06 panel).
