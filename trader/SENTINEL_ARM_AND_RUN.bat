@@ -121,8 +121,21 @@ REM  first cycle showed it was fit to run armed. A cycle that refused (a missing
 REM  witness pin, a waiver, a cap over its ceiling, an unreadable state) used to
 REM  leave "armed": true in place for the whole arming period, so a later
 REM  scheduled run could go live after the operator believed arming had failed.
-"%PY%" -c "import json,os;p='trader_config.json';c=json.load(open(p,encoding='utf-8'));assert isinstance(c,dict);c['armed']=False;c.pop('armed_until',None);t=p+'.disarm.tmp';f=open(t,'w',encoding='utf-8');json.dump(c,f,indent=1);f.close();os.replace(t,p);print('  trader_config.json: armed set back to false')"
-if errorlevel 1 echo  COULD NOT DISARM. Set "armed": false in trader_config.json by hand NOW, or drop a file named TRADER_HALT in this folder.
+"%PY%" -c "import json,os;p='trader_config.json';c=json.load(open(p,encoding='utf-8'));assert isinstance(c,dict);c['armed']=False;c.pop('armed_until',None);t=p+'.disarm.tmp';f=open(t,'w',encoding='utf-8');json.dump(c,f,indent=1);f.flush();os.fsync(f.fileno());f.close();os.replace(t,p);print('  trader_config.json: armed set back to false')"
+if errorlevel 1 goto :disarmfailed
+goto :cyclereport
+
+:disarmfailed
+REM  Second review pass: a disarm that fails must not end in a warning alone.
+REM  A halt file stops every cycle whatever the config says.
+echo halted by SENTINEL_ARM_AND_RUN: the disarm after a failed first cycle did not complete> TRADER_HALT
+echo  COULD NOT DISARM. A file named TRADER_HALT has been written in this folder,
+echo  which stops every cycle. Set "armed": false in trader_config.json by hand,
+echo  then delete TRADER_HALT.
+pause
+exit /b 1
+
+:cyclereport
 echo.
 echo  The first armed cycle did not complete, so the trader has been DISARMED again.
 echo  Why it stopped is at the end of trader_log.txt:
