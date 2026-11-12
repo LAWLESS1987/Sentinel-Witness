@@ -1654,6 +1654,10 @@ def run_once(cfg, plan_only=False):
                                 if book_whole else _guards.starting_total(RESERVE_PATH)),
             bought_total_usd=st.get("bought_total_usd"),
             fiat_buys_week=list(st.get("fiat_buys", [])))
+        # G2: the book as measured this cycle goes into the state file (saved before execute),
+        # because guards.live_gate judges a buy against the record on disk and not against
+        # whatever State it is handed.
+        st["book"] = _guards.book_snapshot(state)
         for vd in _guards.GuardStack().evaluate(state):
             print(f"    [{'ok  ' if vd.allowed else 'BLOCK'}] {vd.guard:<14} {vd.reason}")
             # The two cap guards are shown here but NOT added to guard_blocks.

@@ -145,6 +145,13 @@ class Gated:
         if seal:
             self.seal(orders)
         T.V.all_venues = lambda: list(venues)
+        pf = kw.get("portfolio")
+        if kw.pop("record_book", True) and isinstance(pf, G.State):
+            # G2: as run_once does before it executes -- the measured book is in the state file
+            self.st["book"] = G.book_snapshot(pf)
+            self.st["equity_peak"], self.st["equity_start_of_day"] = pf.equity_peak, pf.equity_start_of_day
+            with open(self.state_path, "w", encoding="utf-8") as fh:
+                json.dump(self.st, fh)
         res = T.execute(self.cfg, self.st, orders, True, [], **kw)
         return res
 

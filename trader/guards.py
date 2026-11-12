@@ -2003,7 +2003,63 @@ GATE_KEYS = (
     "allow_fiat_buys", "weekly_fiat_budget_usd", "contribution_min_cash_pct",
     "contribution_symbols", "symbols", "covenant_home")
 STATE_GATE_KEYS = ("day", "last_seen_day", "last_seen_at", "orders_today", "bought_total_usd",
-                   "fiat_buys", "sealed_signals", "rule5", "last_sold", "closed_trades")
+                   "fiat_buys", "sealed_signals", "rule5", "last_sold", "closed_trades",
+                   "equity_peak", "equity_start_of_day", "book")          # G2: the measured book too
+
+# G2 (review round 1, 2026-11-12). The buy-side guards -- drawdown, the day's loss, the cash
+# floor, concentration -- are arithmetic on the book: equity now, its peak, its value at the
+# start of the day, cash, positions. Until this change the gate took all of those from the
+# State its caller handed it, so a caller in the same process could hand over a healthy book
+# for an account that was down by half. The trader now records the book it measured in its
+# state file before it executes (covenant_trader.run_once), and the gate reads it from there.
+# What it is handed can only refuse: a portfolio that differs from the recorded book is a reason.
+BOOK_VALID_S = 300.0          # a recorded book older than this is not judged against
+
+
+def book_snapshot(state, now=None):
+    """The part of a measured State that the gate will judge a buy against, as it is written to
+    the state file."""
+    return {"at": time.time() if now is None else now,
+            "equity_now": state.equity_now, "cash": state.cash,
+            "positions": dict(state.positions or {})}
+
+
+def book_from_disk(dst, now=None):
+    """(book, None) from the trader's state as read from disk, or (None, why). `book` holds
+    equity_now, equity_peak, equity_start_of_day, cash and positions, every one a finite number
+    that makes sense; anything else is a refusal, never a default."""
+    snap = dst.get("book") if isinstance(dst, dict) else None
+    if not isinstance(snap, dict):
+        return None, "the trader's state file holds no measured book"
+    at, eq, cash = finite_number(snap.get("at")), finite_positive(snap.get("equity_now")), finite_nonnegative(snap.get("cash"))
+    pos = snap.get("positions")
+    if at is None or eq is None or cash is None or not isinstance(pos, dict) \
+            or any(not isinstance(k, str) or finite_nonnegative(v) is None for k, v in pos.items()):
+        return None, "the measured book in the trader's state file cannot be read"
+    t = time.time() if now is None else now
+    age = t - at
+    if not -CLOCK_SLACK_S <= age <= BOOK_VALID_S:
+        return None, "the measured book in the trader's state file is %d s old (limit %d)" % (age, BOOK_VALID_S)
+    peak, start = finite_positive(dst.get("equity_peak")), finite_positive(dst.get("equity_start_of_day"))
+    if peak is None or start is None:
+        return None, "the trader's state file holds no equity peak or no start-of-day equity"
+    if eq > peak * (1.0 + 1e-9):
+        return None, "the measured book is larger than the peak on record, which only ever rises"
+    return {"equity_now": eq, "equity_peak": peak, "equity_start_of_day": start, "cash": cash,
+            "positions": {k: float(v) for k, v in pos.items()}}, None
+
+
+def _book_differs(portfolio, book):
+    """Which of the caller's book numbers differ from the recorded book."""
+    def near(a, b):
+        a, b = finite_number(a), finite_number(b)
+        return a is not None and b is not None and abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
+    out = [k for k in ("equity_now", "cash") if not near(getattr(portfolio, k, None), book[k])]
+    mine = getattr(portfolio, "positions", None)
+    if not isinstance(mine, dict) or set(mine) != set(book["positions"]) \
+            or any(not near(mine[k], book["positions"][k]) for k in mine):
+        out.append("positions")
+    return out
 PERMIT_VALID_S = 120.0
 _PERMITS = {}
 
@@ -2125,18 +2181,32 @@ def live_gate(order, venue, cfg=None, st=None, portfolio=None, caller_blocks=Non
                            "floor, concentration, budgets) could not be evaluated")
         else:
             import dataclasses
-            book = dataclasses.replace(
-                portfolio, orders_today=orders_today_from(dst),
-                bought_total_usd=dst.get("bought_total_usd"),
-                fiat_buys_week=fiat_buys_week_from(dst),
-                last_sold=dict(dst.get("last_sold") or {}),
-                closed_trades=list(dst.get("closed_trades") or []),
-                starting_total_usd=None, now=time.time())
-            try:
-                ok, blocking, _all = GuardStack().may_buy(book, order.get("sym"))
-                blocks = [] if ok else [b.guard for b in blocking]
-            except Exception as e:                               # noqa: BLE001
-                blocks = ["guards unavailable (%s)" % type(e).__name__]
+            measured, book_why = book_from_disk(dst)             # G2: the book is read, not handed in
+            if measured is None:
+                reasons.append("live gate: %s, so the buy-side guards (drawdown, the day's loss, "
+                               "cash floor, concentration) could not be evaluated -- refused" % book_why)
+                blocks = ["no measured book on record"]
+            else:
+                off = _book_differs(portfolio, measured)
+                if off:
+                    reasons.append("live gate: the portfolio handed in differs from the book the "
+                                   "trader recorded in %s -- refused; the gate judges the record"
+                                   % ", ".join(off))
+                book = dataclasses.replace(
+                    portfolio, equity_now=measured["equity_now"], equity_peak=measured["equity_peak"],
+                    equity_start_of_day=measured["equity_start_of_day"], cash=measured["cash"],
+                    positions=dict(measured["positions"]),
+                    orders_today=orders_today_from(dst),
+                    bought_total_usd=dst.get("bought_total_usd"),
+                    fiat_buys_week=fiat_buys_week_from(dst),
+                    last_sold=dict(dst.get("last_sold") or {}),
+                    closed_trades=list(dst.get("closed_trades") or []),
+                    starting_total_usd=None, now=time.time())
+                try:
+                    ok, blocking, _all = GuardStack().may_buy(book, order.get("sym"))
+                    blocks = [] if ok else [b.guard for b in blocking]
+                except Exception as e:                           # noqa: BLE001
+                    blocks = ["guards unavailable (%s)" % type(e).__name__]
         blocks += [str(b) for b in (caller_blocks or [])]
 
     # -- everything preconditions knows, on the DISK config and DISK state --------
