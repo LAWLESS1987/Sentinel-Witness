@@ -410,7 +410,13 @@ def seal_decision_result(cfg, record, runner=None):
         return _refused("witness: covenant's seal answer had an 'ok' that is "
                         "not true or false (%s)" % type(out["ok"]).__name__)
     if runner is None:
-        _remember_seal(record, out)          # R1: only an answer from the real runner
+        # G1 (review round 1): a disarmed rehearsal runs whatever folder the
+        # config or the environment names. A seal from such a folder must
+        # never be remembered, or a later armed gate in the same process
+        # would trust a seal the pinned witness never gave.
+        _pin, _pin_why = pinned_home()
+        if _pin and _same_path(home, _pin):
+            _remember_seal(record, out)      # R1: only an answer from the real runner
     return out
 
 

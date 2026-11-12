@@ -575,6 +575,10 @@ def apply_fills(st, pf):
             if isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd != usd or usd < 0 \
                     or usd == float("inf"):
                 continue
+            # G11 (review round 1): a fill with no order id used to be filed under the
+            # text "None" and could then match a row whose id was lost. It matches nothing.
+            if not f.get("order_id"):
+                continue
             key = (venue, str(f.get("order_id")))
             by_id[key] = by_id.get(key, 0.0) + float(usd)
     notes = []
@@ -585,12 +589,55 @@ def apply_fills(st, pf):
         if got <= 0:
             continue
         want = row.get("usd")
+        # G5 (review round 1): the venues return one page of fills. A later cycle can
+        # see fewer of this order's fills than an earlier one did; what was confirmed
+        # is never taken back within the day.
+        prior = row.get("filled_usd")
+        if isinstance(prior, (int, float)) and not isinstance(prior, bool) and prior == prior                 and prior != float("inf") and prior > got:
+            got = float(prior)
         row["filled_usd"] = got
         row["fill"] = ("CONFIRMED" if isinstance(want, (int, float)) and not isinstance(want, bool)
                        and got >= FILL_COMPLETE * want else "PARTIAL")
         notes.append("%s %s $%.2f at %s: %s, $%.2f filled"
                      % (row.get("side"), row.get("sym"), want or 0.0, row.get("venue"), row["fill"], got))
     return notes
+
+
+def unresolved_symbols(st):
+    """{SYM: why} for every symbol with an order in today's record whose outcome
+    is not known. G7 (review round 1, 2026-11-12).
+
+    execute() writes a row as PENDING before it calls the venue and removes it
+    only on a definite refusal. After a timeout the row stays, with no order id:
+    the venue may have booked it. plan() could not see that row (it sees only the
+    orders open AT the venue, and a filled or cancelled one is not open), so the
+    next cycle planned the same order again under a new client reference, which
+    no venue can recognise as a repeat. A symbol with such a row is planned
+    nothing until a person resolves the row."""
+    out = {}
+    rows = st.get("orders_today") if isinstance(st, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") == "PENDING" or (row.get("fill") is not None and not row.get("txid")):
+            out[str(row.get("sym") or "").upper()] = (
+                "an order for it was sent%s and the answer was lost -- it may be booked"
+                % ((" to " + str(row.get("venue"))) if row.get("venue") else ""))
+    return out
+
+
+def drop_unresolved(orders, st):
+    """(orders with every unresolved symbol removed, the notes saying which)."""
+    held = unresolved_symbols(st)
+    kept, notes = [], []
+    for o in orders:
+        why = held.get(str(o.get("sym") or "").upper())
+        if why is None:
+            kept.append(o)
+        else:
+            notes.append("unresolved order: nothing is planned for %s this cycle (%s); look at the "
+                         "venue, then correct or remove that row in the state file" % (o.get("sym"), why))
+    return kept, notes
 
 
 def book_incomplete(pf):
@@ -1629,6 +1676,8 @@ def run_once(cfg, plan_only=False):
     _week = _guards.fiat_buys_week_from(st) if _guards else None
     week_spent = None if _week is None else sum(r["usd"] for r in _week)
     orders, notes = plan(cfg, pf, week_spent=week_spent)
+    orders, _held_notes = drop_unresolved(orders, st)          # G7: see unresolved_symbols()
+    notes = list(notes) + _held_notes
     print("\n  PLAN")
     for n in notes:
         print(f"    - {n}")

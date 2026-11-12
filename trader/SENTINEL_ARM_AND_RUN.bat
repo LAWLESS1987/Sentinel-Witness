@@ -97,6 +97,7 @@ if errorlevel 1 goto :armfailed
 echo. >> trader_log.txt
 echo ==== %DATE% %TIME% SENTINEL_ARM_AND_RUN ==== >> trader_log.txt
 "%PY%" covenant_trader.py --once >> trader_log.txt 2>&1
+if errorlevel 1 goto :cyclefailed
 echo.
 echo  Cycle finished. Its full report is the end of trader_log.txt.
 powershell -NoProfile -Command "Get-Content trader_log.txt -Tail 45"
@@ -113,6 +114,21 @@ echo.
 echo  Not armed. The phrase was not typed exactly. Nothing was changed.
 pause
 exit /b 0
+
+:cyclefailed
+REM  G13 (review round 1, 2026-11-12). The config was armed above, BEFORE the
+REM  first cycle showed it was fit to run armed. A cycle that refused (a missing
+REM  witness pin, a waiver, a cap over its ceiling, an unreadable state) used to
+REM  leave "armed": true in place for the whole arming period, so a later
+REM  scheduled run could go live after the operator believed arming had failed.
+"%PY%" -c "import json,os;p='trader_config.json';c=json.load(open(p,encoding='utf-8'));assert isinstance(c,dict);c['armed']=False;c.pop('armed_until',None);t=p+'.disarm.tmp';f=open(t,'w',encoding='utf-8');json.dump(c,f,indent=1);f.close();os.replace(t,p);print('  trader_config.json: armed set back to false')"
+if errorlevel 1 echo  COULD NOT DISARM. Set "armed": false in trader_config.json by hand NOW, or drop a file named TRADER_HALT in this folder.
+echo.
+echo  The first armed cycle did not complete, so the trader has been DISARMED again.
+echo  Why it stopped is at the end of trader_log.txt:
+powershell -NoProfile -Command "Get-Content trader_log.txt -Tail 25"
+pause
+exit /b 1
 
 :armfailed
 echo.

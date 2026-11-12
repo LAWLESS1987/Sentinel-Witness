@@ -270,8 +270,10 @@ check("F5 the interpreter is not taken from covenant_home in trader_config.json 
       "(it is this repository's, else the pinned folder's)",
       "ConvertFrom-Json" not in code and "covenant_home.pin" in code)
 snippets = [m.group(1).replace("%%", "%") for m in re.finditer(r'^"%PY%" -c "(.*)"\s*$', code, re.M)]
-check("F6 two Python commands are found in the file: the phrase check, then the arming",
-      len(snippets) == 2 and "TYPED" in snippets[0] and "armed_until" in snippets[1],
+check("F6 three Python commands are found in the file: the phrase check, the arming, and (G13) the disarm "
+      "that runs when the first armed cycle refuses",
+      len(snippets) == 3 and "TYPED" in snippets[0] and "armed_until" in snippets[1]
+      and "c['armed']=False" in snippets[2] and "c['armed']=True" not in snippets[2],
       [s[:60] for s in snippets])
 phrase_snip, arm_snip = (snippets + ["raise SystemExit(9)", "raise SystemExit(9)"])[:2]
 PHRASE = m_phrase.group(1) if m_phrase else "?"
