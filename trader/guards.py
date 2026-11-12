@@ -519,10 +519,28 @@ class ReserveFloor(Guard):
 # Four orders a day at the shipped $300 daily cap is $1,200 of notional a
 # month, which on a book this size is roughly 18% a year paid to the exchange
 # before any market move at all. The cap is a cost control, and a bug control.
+#
+# H5 (2026-11-12): THE SHIPPED DEFAULTS WERE $100 / $300 / 4 (the paragraph
+# above is written against them and is kept as the record of that). Every
+# document in this folder states $25 an order, $50 a day, 2 orders a day --
+# README "What has to say yes before a live order", MY_STRATEGY.md Rule 6
+# ("$25 per order"), rule5_waiver's own docstring, trader_config.example.json
+# -- so a config that left a cap out fell back to four times what was written
+# down. The defaults are now those documented numbers, and the same numbers
+# are HARD_CEILINGS: a config may LOWER a cap and may not raise one. A value
+# above a ceiling is refused with the reason (config_reasons); it is never
+# clamped, because a silently clamped number is a config that says one thing
+# while the program does another. Raising a ceiling is an edit to this file,
+# in the open, like HOLD_ONLY.
+HARD_CEILINGS = {
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
+}
 CAP_DEFAULTS = {
-    "max_order_usd": 100.0,
-    "max_daily_notional_usd": 300.0,
-    "max_orders_per_day": 4,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
     "min_order_usd": 5.0,
     # R6 contribution (2026-09-06): dollars the trader may put to work in any
     # trailing seven days. 0 is the shipped default and means NO contribution
@@ -534,6 +552,73 @@ CAP_DEFAULTS = {
 ALLOW_FIAT_KEY = "allow_fiat_buys"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "trader_config.json")
+
+# H5: THE WHOLE SHIPPED CONFIG, here because guards cannot import
+# covenant_trader (see TRADER_STATE below for the loop). It must equal
+# covenant_trader.DEFAULT_CONFIG; test_h05_config.py pins the two together.
+SHIPPED_DEFAULTS = {
+    "armed": False,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
+    "min_order_usd": 5.0,
+    "max_position_pct": 0.20,
+    "min_cash_pct": 0.10,
+    "seal_required": True,
+    "min_sealed_signals": 30,
+    "rule5_require_significance": True,
+    "allow_fiat_buys": False,
+    "weekly_fiat_budget_usd": 0.0,
+    "xrpl_record": False,
+    "xrpl_network": "testnet",
+    "xrpl_allow_mainnet": False,
+    "contribution_min_cash_pct": 0.10,
+    "contribution_symbols": [],
+    "node_ports": [5000],
+    "node_key": "covenant_A.db.key",
+    "loop_seconds": 3600,
+    "symbols": [],
+}
+
+
+def with_defaults(cfg, skip=()):
+    """`cfg` over the shipped defaults: a key the config leaves out takes the
+    shipped value, never "off". Keys in `skip` are left as the config has them.
+    Something that is not a dict is the shipped defaults alone (armed false)."""
+    out = {k: (list(v) if isinstance(v, list) else v)
+           for k, v in SHIPPED_DEFAULTS.items() if k not in skip}
+    if isinstance(cfg, dict):
+        out.update(cfg)
+    return out
+
+
+def config_reasons(cfg):
+    """Why this config is refused, as a list; [] when it is not. H5.
+
+    Each cap that is PRESENT must be a finite number above zero (a whole
+    number for the order count), and at or under its ceiling in
+    HARD_CEILINGS. A cap that is absent is not a reason: it takes the shipped
+    default, which is the ceiling. Nothing here changes a value."""
+    if not isinstance(cfg, dict):
+        return ["config: it is not an object"]
+    out = []
+    for key, ceiling in HARD_CEILINGS.items():
+        if key not in cfg:
+            continue
+        v = finite_positive(cfg[key])
+        if v is None:
+            out.append("config: %s is %r, not a finite number above zero -- refused"
+                       % (key, cfg[key]))
+        elif key == "max_orders_per_day" and v != int(v):
+            out.append("config: %s is %r, not a whole number -- refused" % (key, cfg[key]))
+        elif v > ceiling + 1e-9:
+            out.append("config: %s is %g, above the hard ceiling of %g set in code "
+                       "(guards.HARD_CEILINGS) -- refused, not clamped; a config may "
+                       "only lower it" % (key, v, ceiling))
+    if "min_order_usd" in cfg and finite_nonnegative(cfg["min_order_usd"]) is None:
+        out.append("config: min_order_usd is %r, not a finite number at or above zero "
+                   "-- refused" % (cfg["min_order_usd"],))
+    return out
 
 
 def caps(path: Optional[str] = None) -> dict:
@@ -762,6 +847,11 @@ class PerDayCap(Guard):
                      else self._max_notional)
 
     def check(self, st, sym=None):
+        # H5: the numbers this guard was handed, against the ceilings in code.
+        over = config_reasons({"max_orders_per_day": self.max_orders,
+                               "max_daily_notional_usd": self.max_notional})
+        if over:
+            return Verdict(False, self.name, "; ".join(over))
         if st.orders_today is None:
             return Verdict(False, self.name,
                            "the day's orders are unknown (no trader state could be "
@@ -845,6 +935,12 @@ class PerTradeCap(Guard):
         return max(0.0, min(self.max_usd, self.max_notional - spent))
 
     def check(self, st, sym=None):
+        # H5: as PerDayCap.check.
+        over = config_reasons({"max_order_usd": self.max_usd, "min_order_usd": self.min_usd,
+                               "max_orders_per_day": self.max_orders,
+                               "max_daily_notional_usd": self.max_notional})
+        if over:
+            return Verdict(False, self.name, "; ".join(over))
         room = self.largest_allowed(st)
         if room is None:
             why = ("the day's orders are unknown (no trader state could be read)"
@@ -1245,14 +1341,22 @@ HALT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TRADER_HALT")
 
 
 def load_config(path: Optional[str] = None) -> dict:
-    """The whole trader config as a dict. Unreadable or malformed reads as {},
-    which makes `armed` false -- the posture allow_fiat_buys() already takes."""
+    """The whole trader config as a dict, OVER THE SHIPPED DEFAULTS.
+
+    H5 (2026-11-12). This returned the file's own keys and nothing else, so a
+    config that simply left `seal_required` and `min_sealed_signals` out had no
+    seal requirement and no Rule 5: preconditions() reads them with .get(), and
+    absent read as off. covenant_trader.load_config has always merged its
+    DEFAULT_CONFIG; this reader -- the one the sentinel path uses -- did not.
+
+    Unreadable or malformed still makes `armed` false: it reads as the shipped
+    defaults alone, which are disarmed."""
     try:
         with open(path or CONFIG_PATH, encoding="utf-8") as fh:
             cfg = json.load(fh)
-        return cfg if isinstance(cfg, dict) else {}
+        return with_defaults(cfg if isinstance(cfg, dict) else None)
     except (OSError, ValueError):
-        return {}
+        return with_defaults(None)
 
 
 def load_trader_state(path: Optional[str] = None):
@@ -1319,7 +1423,12 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     caller       "trader" or "sentinel". Adds reasons, never removes them.
     """
     bad = []
-    cfg = load_config(config_path) if cfg is None else cfg
+    # H5: a key the config leaves out takes the SHIPPED value, never "off" --
+    # for a config read from disk (load_config) and for one handed in. The cap
+    # keys are left out of the fill for a handed-in config because they have
+    # their own fallback through caps(config_path), below.
+    cfg = (load_config(config_path) if cfg is None
+           else with_defaults(cfg, skip=tuple(CAP_DEFAULTS)))
     if st is None:
         st = load_trader_state(state_path)
     if st is None:
@@ -1361,7 +1470,15 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
 
     def _n(key):
         v = cfg.get(key)
-        return v if isinstance(v, (int, float)) else c[key]
+        return v if finite_number(v) is not None else c[key]
+
+    # H5: THE CEILINGS. The numbers about to be used -- the config's where it
+    # states them, the fallback's where it does not -- are checked against
+    # HARD_CEILINGS, and a number above one (or not a number) is a reason for
+    # THIS order, said in words. Nothing is clamped.
+    bad.extend(config_reasons({k: (cfg[k] if k in cfg else c[k])
+                               for k in ("max_order_usd", "max_daily_notional_usd",
+                                         "max_orders_per_day", "min_order_usd")}))
 
     gs = State(equity_now=0.0, equity_peak=0.0, equity_start_of_day=0.0,
                closed_trades=[], last_sold={}, positions={}, cash=0.0,

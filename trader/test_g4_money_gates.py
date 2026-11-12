@@ -44,11 +44,17 @@ def check(label, ok, detail=""):
 # A configuration with every gate satisfied, so that each test can break exactly
 # one thing. daily_plan_required is off here because the plan gate is DP1's
 # subject and is driven separately below.
+# H5 (2026-11-12): THE FIXTURE'S NUMBERS WERE $1,000 an order, 5 orders and
+# $5,000 a day, with a $100 test order. guards.HARD_CEILINGS now refuses any
+# cap above $25 / $50 / 2, so that fixture was no longer "clear": every check
+# below carried the ceiling's reason as well as its own. The numbers are
+# rescaled to sit inside the ceilings ($25, 2 orders, $50; a $20 order) and
+# nothing else about any check is changed.
 def clear_cfg(**over):
     cfg = {"armed": True, "daily_plan_required": False, "seal_required": True,
            "min_sealed_signals": 0, "rule5_require_significance": False,
-           "min_order_usd": 10.0, "max_order_usd": 1000.0,
-           "max_orders_per_day": 5, "max_daily_notional_usd": 5000.0}
+           "min_order_usd": 10.0, "max_order_usd": 25.0,
+           "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}
     cfg.update(over)
     return cfg
 
@@ -60,7 +66,7 @@ def clear_st(**over):
     return st
 
 
-ORDER = {"side": "buy", "usd": 100.0, "sym": "XRP-USD"}
+ORDER = {"side": "buy", "usd": 20.0, "sym": "XRP-USD"}
 
 
 def reasons(order=None, **kw):
@@ -235,8 +241,8 @@ def main():
 
     # 6. over the room left today
     drives("G4.6 an order over the placeable room refuses, a smaller one clears",
-           {"order": {"side": "buy", "usd": 900.0, "sym": "XRP-USD"},
-            "cfg": clear_cfg(max_order_usd=200.0)}, "placeable now")
+           {"order": {"side": "buy", "usd": 24.0, "sym": "XRP-USD"},
+            "cfg": clear_cfg(max_order_usd=12.0)}, "placeable now")
 
     # 7. the per-day cap.
     #
@@ -246,7 +252,7 @@ def main():
     # at all, so five orders became none and the cap correctly said nothing.
     # The fixture now carries today's date, which is what a real state has.
     today = _t.strftime("%Y-%m-%d", _t.localtime())
-    full = clear_st(day=today, orders_today=[{"usd": 10.0, "sym": "XRP-USD"}] * 5)
+    full = clear_st(day=today, orders_today=[{"usd": 10.0, "sym": "XRP-USD"}] * 2)
     empty = clear_st(day=today, orders_today=[])
     on = reasons(st=full)
     off = reasons(st=empty)

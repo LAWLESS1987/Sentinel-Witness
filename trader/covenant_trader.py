@@ -93,11 +93,16 @@ HALT = os.path.join(HERE, "TRADER_HALT")
 STATE = os.environ.get("COVENANT_TRADER_STATE") or os.path.join(
     os.path.expanduser("~"), ".covenant", "trader_state.json")
 
+# H5 (2026-11-12): the three caps were 100.0 / 300.0 / 4 here. They are now the
+# numbers the README and MY_STRATEGY.md state ($25 an order, $50 a day, 2 a
+# day), which are also guards.HARD_CEILINGS -- so a config that leaves a cap
+# out falls back to the documented number, not to four times it. This dict
+# must equal guards.SHIPPED_DEFAULTS (test_h05_config.py).
 DEFAULT_CONFIG = {
     "armed": False,
-    "max_order_usd": 100.0,
-    "max_daily_notional_usd": 300.0,
-    "max_orders_per_day": 4,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
     "min_order_usd": 5.0,
     "max_position_pct": 0.20,
     "min_cash_pct": 0.10,
@@ -1151,6 +1156,14 @@ def witness_ready(cfg, reserve=None):
     loose = witness.terms_reasons(cfg)
     if loose:
         return "; ".join(loose)
+    # H5 (2026-11-12): a config with a cap above its hard ceiling (or a cap
+    # that is not a number) refuses the cycle here, armed or not, for the same
+    # reason as the terms above -- nothing is read, planned or written on a
+    # config the program will not honour.
+    if _guards is not None:
+        over = _guards.config_reasons(cfg)
+        if over:
+            return "; ".join(over)
     return None
 
 
@@ -1428,6 +1441,13 @@ def cmd_status(cfg):
     print(f"  max order          : ${cfg['max_order_usd']:,.0f}")
     print(f"  daily notional cap : ${cfg['max_daily_notional_usd']:,.0f}")
     print(f"  orders per day     : {cfg['max_orders_per_day']}")
+    if _guards is not None:                                           # H5
+        hc = _guards.HARD_CEILINGS
+        print(f"  hard ceilings      : ${hc['max_order_usd']:,.0f} an order, "
+              f"${hc['max_daily_notional_usd']:,.0f} a day, {hc['max_orders_per_day']} orders a day "
+              f"(set in guards.py; a config may only lower them)")
+        for why in _guards.config_reasons(cfg):
+            print(f"  CONFIG REFUSED     : {why} -- no cycle will run")
     print(f"  seal required      : {cfg.get('seal_required')}")
     print(f"  Rule 5 threshold   : {st.get('sealed_signals', 0)} / "
           f"{cfg.get('min_sealed_signals')} sealed signals")

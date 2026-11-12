@@ -114,24 +114,26 @@ check("A3b ...an order with no quantity at all (the sentinel path has none) is n
       reasons(no_qty) == [], reasons(no_qty))
 
 # ---- B: the day's record -------------------------------------------------------
-pd = G.PerDayCap(max_orders=4, max_notional=50.0)
-pt = G.PerTradeCap(max_usd=25.0, min_usd=5.0, max_orders=4, max_notional=50.0)
+pd = G.PerDayCap(max_orders=2, max_notional=50.0)
+pt = G.PerTradeCap(max_usd=25.0, min_usd=5.0, max_orders=2, max_notional=50.0)
 bad_rows = {"NaN": NAN, "+inf": INF, "zero": 0.0, "negative": -40.0, "True": True,
             "the string '10'": "10", "None": None}
 let = []
 for k, v in bad_rows.items():
-    s = gstate(orders_today=[{"usd": 45.0, "side": "sell"}, {"usd": v, "side": "sell"}])
+    s = gstate(orders_today=[{"usd": v, "side": "sell"}])      # one row: the count (1 of 2) is not what blocks
     if pd.check(s).allowed or pt.largest_allowed(s) is not None or pt.check(s).allowed:
         let.append(k)
 check("B1 a row that is " + ", ".join(bad_rows) + " makes the day unknown: both caps block",
       not let, let)
 s_ok = gstate(orders_today=[{"usd": 20.0, "side": "sell"}])
-check("B1b ...and a clean $20 row does not: 1/4 orders, $30 still placeable",
+check("B1b ...and a clean $20 row does not: 1/2 orders, $25 still placeable",
       pd.check(s_ok).allowed and pt.check(s_ok).allowed
       and abs(pt.largest_allowed(s_ok) - 25.0) < 1e-9, (pd.check(s_ok), pt.check(s_ok)))
-s_neg = gstate(orders_today=[{"usd": 45.0, "side": "sell"}, {"usd": -40.0, "side": "sell"}])
-check("B2 the negative row does not hand back room: $45 placed and '-$40' is not '$5 used'",
-      pt.largest_allowed(s_neg) is None, pt.largest_allowed(s_neg))
+pt30 = G.PerTradeCap(max_usd=25.0, min_usd=5.0, max_orders=2, max_notional=30.0)
+check("B2 a day lowered to $30: a clean $25 row leaves $5; a NaN row leaves UNKNOWN, where it "
+      "used to leave the whole $25 (NaN is never >= the cap)",
+      abs(pt30.largest_allowed(gstate(orders_today=[{"usd": 25.0, "side": "sell"}])) - 5.0) < 1e-9
+      and pt30.largest_allowed(gstate(orders_today=[{"usd": NAN, "side": "sell"}])) is None)
 through = reasons(good, st={"day": TODAY, "orders_today": [{"usd": NAN, "side": "sell"}]})
 check("B3 through guards.preconditions: a NaN row in today's record refuses the next order "
       "in both caps' names", any(r.startswith("per_day_cap:") for r in through)
