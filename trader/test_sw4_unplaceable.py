@@ -169,7 +169,11 @@ check("U6b ...and the older note is the one printed", any("cap trims raise" in n
       or any("the cap trims raise" in n for n in n6), n6)
 
 # ---- U7: the gate does refuse it ---------------------------------------------------
-gate_cfg = dict(cfg(), armed=True, daily_plan_required=False, seal_required=True,
+# H7 (2026-11-12): an arming carries an expiry (guards.arming); this fixture
+# arms for one hour. See test_h07_arming.py.
+gate_cfg = dict(cfg(), armed=True,
+                armed_until=T.time.strftime("%Y-%m-%dT%H:%M:%SZ", T.time.gmtime(T.time.time() + 3600)),
+                daily_plan_required=False, seal_required=True,
                 min_sealed_signals=0, rule5_require_significance=False,
                 max_daily_notional_usd=50.0)
 rs = G.preconditions({"side": "sell", "usd": link[0]["usd"] if link else 600.0, "sym": "LINK"},

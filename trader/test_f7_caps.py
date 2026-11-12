@@ -277,7 +277,10 @@ def main():
     # suite stayed 56/56). S4b greps for the delegating call, so it stays green
     # when the trader makes that call and then returns [] instead of its answer
     # -- the enforcement point silently emptied. These two ask the functions.
-    capcfg = {"armed": True, "daily_plan_required": False, "max_order_usd": 25.0, "min_order_usd": 5.0,   # the caps, not the plan gate (A106)
+    # H7 (2026-11-12): an arming carries an expiry (guards.arming); the two
+    # armed fixtures in this file arm for one hour. See test_h07_arming.py.
+    capcfg = {"armed": True, "armed_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)),
+              "daily_plan_required": False, "max_order_usd": 25.0, "min_order_usd": 5.0,   # the caps, not the plan gate (A106)
               "max_orders_per_day": 2, "max_daily_notional_usd": 50.0,
               "seal_required": False, "min_sealed_signals": 0,
               "rule5_require_significance": False}
@@ -414,7 +417,8 @@ def main():
     _st = {"day": time.strftime("%Y-%m-%d"), "orders_today": [], "last_sold": {},
            "closed_trades": [], "bought_total_usd": 0.0, "equity_peak": 100.0,
            "equity_start_of_day": 100.0}
-    _cfg = dict(T.DEFAULT_CONFIG, armed=True, seal_required=False, daily_plan_required=False,   # the caps, not the plan gate (A106)
+    _cfg = dict(T.DEFAULT_CONFIG, armed=True, armed_until=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)),   # H7: armed for one hour
+                seal_required=False, daily_plan_required=False,   # the caps, not the plan gate (A106)
                 min_sealed_signals=0, rule5_require_significance=False)
     _order = {"sym": "XLM", "side": "sell", "qty": 10.0, "usd": 20.0,
               "rule": "test", "at": {"kraken": 10.0}}

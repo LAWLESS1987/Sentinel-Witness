@@ -141,7 +141,9 @@ _saved = []
 T.save_state = lambda s: _saved.append(1)
 T.venue_for = lambda o, lv: _Stub()
 T.V.all_venues = lambda: [_Stub()]
-armed = dict(BASE_CFG); armed.update({"armed": True, "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})   # R6, not the plan gate (A106)
+# H7 (2026-11-12): an arming carries an expiry (guards.arming); this fixture
+# arms for one hour. See test_h07_arming.py.
+armed = dict(BASE_CFG); armed.update({"armed": True, "armed_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)), "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})   # R6, not the plan gate (A106)
 state = {"sealed_signals": 30, "orders_today": [], "rule5": {"clears": True}, "day": "x", "fiat_buys": []}
 res = T.execute(armed, state, [{"sym": "XLM", "side": "buy", "qty": 25.0, "usd": 25.0, "rule": "R6 contribution"}],
                 sealed_ok=True, guard_blocks=[])

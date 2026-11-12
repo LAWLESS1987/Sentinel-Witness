@@ -54,8 +54,17 @@ def fake_covenant():
     return d
 
 
+# H7 (2026-11-12): AN ARMING NOW CARRIES AN EXPIRY. guards.arming() reads
+# `armed: true` as armed only with an `armed_until` that is an ISO time with
+# its zone, in the future and at most 24 hours ahead; without one the config
+# is DISARMED and every fixture below that arms would be refused for that
+# alone. So the fixtures arm for one hour from now. Nothing else about any
+# check is changed; the expiry itself is driven in test_h07_arming.py.
+_ARMED_UNTIL = T.time.strftime("%Y-%m-%dT%H:%M:%SZ", T.time.gmtime(T.time.time() + 3600))
+
+
 def base_cfg(**over):
-    c = {"armed": True, "daily_plan_required": False, "max_order_usd": 25.0,
+    c = {"armed": True, "armed_until": _ARMED_UNTIL, "daily_plan_required": False, "max_order_usd": 25.0,
          "min_order_usd": 5.0, "max_orders_per_day": 2, "max_daily_notional_usd": 50.0,
          "seal_required": False, "min_sealed_signals": 30,
          "rule5_require_significance": True}

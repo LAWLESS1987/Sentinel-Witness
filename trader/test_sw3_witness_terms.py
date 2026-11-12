@@ -240,7 +240,12 @@ try:
     T.seal_decision = lambda cfg, rec: touched.append("seal") or (False, "")
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        T.run_once({"covenant_home": home, "armed": True, "seal_required": False})
+        # H7 (2026-11-12): without an unexpired armed_until this config is
+        # DISARMED and the cycle would run as a rehearsal instead of meeting
+        # the term this check is about. It arms for one hour.
+        T.run_once({"covenant_home": home, "armed": True, "seal_required": False,
+                    "armed_until": T.time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   T.time.gmtime(T.time.time() + 3600))})
     check("T5g a real cycle, armed with the seal off: reads, plans, seals and saves NOTHING",
           not touched and "REFUSING THIS CYCLE" in out.getvalue() and "unwitnessed" in out.getvalue(),
           (touched, out.getvalue()[-200:]))

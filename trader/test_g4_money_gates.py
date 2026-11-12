@@ -50,8 +50,19 @@ def check(label, ok, detail=""):
 # below carried the ceiling's reason as well as its own. The numbers are
 # rescaled to sit inside the ceilings ($25, 2 orders, $50; a $20 order) and
 # nothing else about any check is changed.
+# H7 (2026-11-12): AN ARMING NOW CARRIES AN EXPIRY. guards.arming() reads
+# `armed: true` as armed only with an `armed_until` that is an ISO time with
+# its zone, in the future and at most 24 hours ahead; without one the config
+# is DISARMED and every fixture below that arms would be refused for that
+# alone. So the fixtures arm for one hour from now. Nothing else about any
+# check is changed; the expiry itself is driven in test_h07_arming.py.
+import time as _time_h7
+_ARMED_UNTIL = _time_h7.strftime("%Y-%m-%dT%H:%M:%SZ", _time_h7.gmtime(_time_h7.time() + 3600))
+
+
 def clear_cfg(**over):
-    cfg = {"armed": True, "daily_plan_required": False, "seal_required": True,
+    cfg = {"armed": True, "armed_until": _ARMED_UNTIL,
+           "daily_plan_required": False, "seal_required": True,
            "min_sealed_signals": 0, "rule5_require_significance": False,
            "min_order_usd": 10.0, "max_order_usd": 25.0,
            "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}

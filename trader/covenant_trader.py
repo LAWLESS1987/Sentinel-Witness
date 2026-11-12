@@ -1220,6 +1220,21 @@ def rehearsal_lines(cfg):
 def run_once(cfg, plan_only=False):
     global LAST_REFUSAL
     LAST_REFUSAL = None
+    # H7 (2026-11-12): AN ARMING THAT IS NOT COMPLETE AND CURRENT IS NO ARMING.
+    # The config may say armed and be missing its expiry, or past it; then the
+    # whole cycle runs DISARMED -- a rehearsal against the venues' dry-run
+    # endpoints -- and says so first. The config on disk is not edited.
+    arm_note = None
+    if isinstance(cfg, dict) and cfg.get("armed"):
+        ok_armed, arm_why = (_guards.arming(cfg) if _guards is not None
+                             else (False, "DISARMED: guards.py unavailable, so the arming cannot be checked"))
+        if not ok_armed:
+            arm_note = arm_why
+            cfg = dict(cfg)
+            cfg["armed"] = False
+    if arm_note:
+        print("\n  " + arm_note)
+        print("  This cycle runs DISARMED: nothing it does can book an order.")
     why = witness_ready(cfg)
     if why:
         hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
@@ -1257,7 +1272,9 @@ def run_once(cfg, plan_only=False):
         return
 
     hr(f"COVENANT TRADER   {time.strftime('%Y-%m-%d %H:%M')}"
-       + ("   [ARMED]" if cfg.get("armed") else "   [disarmed]"))
+       + (f"   [ARMED until {cfg.get('armed_until')}]" if cfg.get("armed") else "   [disarmed]"))
+    if arm_note:
+        print("  " + arm_note)
 
     for line in rehearsal_lines(cfg):
         print(line)
@@ -1490,6 +1507,10 @@ def cmd_status(cfg):
         st = {}
     hr("STATUS")
     print(f"  armed              : {cfg.get('armed')}")
+    if _guards is not None:                                                    # H7
+        _ok, _why = _guards.arming(cfg)
+        print(f"  armed until        : {cfg.get('armed_until')!r}")
+        print(f"  in effect          : {'ARMED -- ' + _why if _ok else _why}")
     print(f"  halt file present  : {os.path.exists(HALT)}  ({os.path.basename(HALT)})")
     print(f"  max order          : ${cfg['max_order_usd']:,.0f}")
     print(f"  daily notional cap : ${cfg['max_daily_notional_usd']:,.0f}")

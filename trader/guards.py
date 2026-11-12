@@ -35,7 +35,7 @@ DESIGN RULES
     threshold instead of guessing at the reason.
 """
 from __future__ import annotations
-import json, math, os, time
+import datetime, json, math, os, time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -392,6 +392,70 @@ def trading_scope(cfg):
         if not isinstance(v, str) or not v.strip():
             return None
     return {"open_reserve_pct": float(pct), "by": s["by"], "at": s["at"], "words": s["words"]}
+
+
+# ---- H7 (2026-11-12): AN ARMING EXPIRES ---------------------------------------
+# `armed: true` was one click in SENTINEL_ARM_AND_RUN.bat and stayed true until
+# somebody remembered to edit it back: a trader armed for one cycle in October
+# was still armed in November. And `if not cfg.get("armed")` took any truthy
+# value -- the text "false" armed it.
+#
+# An arming is now the boolean true AND `armed_until`: an ISO-8601 time WITH
+# its zone (2026-11-12T21:00:00Z), in the future, and at most ARMED_MAX_S
+# ahead. Missing, malformed, zoneless, too far ahead or passed all mean
+# DISARMED, with the reason. arming() is the one reading; preconditions asks
+# it for every order, and covenant_trader.run_once runs the whole cycle as a
+# rehearsal when it says no.
+ARMED_MAX_S = 24 * 3600.0
+
+
+def parse_utc(s):
+    """Epoch seconds for an ISO-8601 time that carries its zone (a trailing Z
+    or +hh:mm), or None. A time with no zone is refused rather than guessed:
+    local and UTC differ by hours, and hours are what an expiry is made of."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    if t[-1] in "Zz":
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        return None
+    try:
+        return d.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def arming(cfg, now=None):
+    """(armed, why). armed is True only for a complete, unexpired arming."""
+    if not isinstance(cfg, dict) or not cfg.get("armed"):
+        return False, "armed=false in trader_config.json"
+    if cfg.get("armed") is not True:
+        return False, ("DISARMED: armed is %r in trader_config.json, not the boolean true"
+                       % (cfg.get("armed"),))
+    t = time.time() if now is None else now
+    if finite_number(t) is None:
+        return False, "DISARMED: the time now is not a finite number, so no expiry can be checked"
+    until = cfg.get("armed_until")
+    if until is None:
+        return False, ("DISARMED: armed=true but armed_until is missing -- an arming carries "
+                       "its own expiry (an ISO time with its zone, at most %d hours ahead)"
+                       % (ARMED_MAX_S // 3600))
+    at = parse_utc(until)
+    if at is None:
+        return False, ("DISARMED: armed_until %r is not an ISO-8601 time with its zone "
+                       "(for example 2026-11-12T21:00:00Z)" % (until,))
+    if at <= t:
+        return False, ("DISARMED: the arming expired at %s (%d minutes ago) -- arm again to "
+                       "place live orders" % (until, int((t - at) // 60)))
+    if at - t > ARMED_MAX_S:
+        return False, ("DISARMED: armed_until %s is %.1f hours ahead; an arming lasts at most "
+                       "%d hours" % (until, (at - t) / 3600.0, ARMED_MAX_S // 3600))
+    return True, "armed until %s" % until
 
 
 # ---- H6 (2026-11-12): WHAT AN ARMED CONFIG MAY NOT SWITCH OFF -----------------
@@ -1494,8 +1558,11 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         bad.append(STATE_UNREADABLE)
         st = {}
 
-    if not cfg.get("armed"):
-        bad.append("armed=false in trader_config.json")
+    # H7: an arming is the boolean true with an unexpired armed_until, or it is
+    # not an arming. arming() says which, and why.
+    _armed, _arm_why = arming(cfg, now)
+    if not _armed:
+        bad.append(_arm_why)
     # H4: said in its own words as well as through the caps going unknown.
     _clock = clock_back(st, now)
     if _clock:

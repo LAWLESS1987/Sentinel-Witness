@@ -194,7 +194,17 @@ def main() -> int:
     print("  Read-only. Reads no key, places nothing, arms nothing.")
 
     cfg, err = load_cfg()
-    armed = bool(cfg.get("armed"))
+    # H7 (2026-11-12): an arming carries an expiry. `armed: true` with no
+    # armed_until, a malformed one, one more than 24 hours ahead or one that
+    # has passed is DISARMED, and guards.arming() is the one reading of that.
+    # If guards cannot be imported the config's own word is used, which errs
+    # toward reporting ARMED -- the direction this checker should err in.
+    arm_why = None
+    try:
+        import guards as _ga
+        armed, arm_why = _ga.arming(cfg)
+    except Exception:                                              # noqa: BLE001
+        armed = bool(cfg.get("armed"))
     halted = os.path.exists(HALT)
 
     print()
@@ -207,6 +217,8 @@ def main() -> int:
     else:
         print("      armed : %s" % ("TRUE  <-- live orders CAN be booked" if armed
                                     else "false  -- every order is blocked here"))
+        if arm_why and (armed or cfg.get("armed")):
+            print("              %s" % arm_why)
     print("      halt file (TRADER_HALT) : %s"
           % ("PRESENT -- everything blocked regardless" if halted else "absent"))
 
