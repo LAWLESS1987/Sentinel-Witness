@@ -93,17 +93,23 @@ check("W1c a cfg that is not a dict is no waiver, not a crash", G.rule5_waiver(N
 
 # ---- W2: it waives Rule 5 and nothing else -------------------------------------
 without = reasons(base_cfg())
-withw = reasons(base_cfg(rule5_waiver=WAIVER))
+# H6 (2026-11-12): THE WAIVER IS HONOURED IN A DISARMED REHEARSAL ONLY. W2b and
+# W2d drove it with armed=true, which is exactly what guards.preconditions now
+# refuses ("armed with a Rule 5 waiver"). Both are restated on a disarmed
+# config -- the only place the waiver still lifts Rule 5 -- and the armed half
+# is driven both ways in test_h06_waivers_witness.py. W2e-W2i are unchanged:
+# they assert what the waiver does NOT lift, which holds armed or not.
+withw = reasons(base_cfg(armed=False, rule5_waiver=WAIVER))
 check("W2a without a waiver, 7 of 30 signals refuses in Rule 5's own words",
       rule5_in(without), without)
-check("W2b with the waiver, Rule 5 no longer refuses", not rule5_in(withw), withw)
+check("W2b DISARMED (a rehearsal), with the waiver, Rule 5 no longer refuses", not rule5_in(withw), withw)
 sig = base_cfg(min_sealed_signals=0, rule5_waiver=dict(WAIVER, waived=False))
 check("W2c ...and the significance half is waived the same way: count met, record "
       "not clear, refused without the waiver",
       rule5_in(reasons(sig, st={"orders_today": [], "sealed_signals": 9,
                                 "rule5": {"clears": False, "why": "0/9 wins"}})))
-check("W2d ...and cleared with it",
-      not rule5_in(reasons(base_cfg(min_sealed_signals=0, rule5_waiver=WAIVER),
+check("W2d ...and cleared with it, disarmed",
+      not rule5_in(reasons(base_cfg(armed=False, min_sealed_signals=0, rule5_waiver=WAIVER),
                            st={"orders_today": [], "sealed_signals": 9,
                                "rule5": {"clears": False, "why": "0/9 wins"}})))
 over = {"side": "buy", "usd": 40.0, "sym": "XLM"}

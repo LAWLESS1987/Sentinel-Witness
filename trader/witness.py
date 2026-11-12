@@ -79,6 +79,98 @@ def covenant_home(cfg=None):
     return os.path.abspath(home)
 
 
+# ---- H6 (2026-11-12): WHEN ARMED, THE WITNESS FOLDER IS PINNED ----------------
+# covenant_home() above takes the folder from an environment variable, else
+# from this trader's own gitignored config. That folder supplies the Python
+# that seals, the Python that answers "is today approved", the floor file and
+# the halt file -- so whoever could set one variable or edit one line chose
+# the witness, its interpreter (_python runs <home>/.venv) and its answers.
+#
+# A DISARMED run may still do that: it is a rehearsal, places nothing, and the
+# copied suites depend on it. An ARMED run may not. Armed, the folder must be
+# the one pinned in code (PINNED_COVENANT_HOME) or in PIN_FILE -- a file in a
+# folder this trader never writes to -- and an environment or config value
+# that names any other folder refuses. No Python is run from a folder that is
+# not the pin while armed (effective_home, used by the seal and the gate).
+#
+# WHAT THIS DOES NOT DO: the pin file belongs to the same OS user. It closes
+# the one-line road (an env var, a config edit), not the account.
+PINNED_COVENANT_HOME = None
+PIN_FILE = os.path.join(os.path.expanduser("~"), ".sentinel_witness", "covenant_home.pin")
+
+
+def _same_path(a, b):
+    try:
+        return (os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b)))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def pinned_home():
+    """(the pinned covenant folder, "") or (None, why there is none).
+
+    The code constant wins; else the first line of PIN_FILE that is not blank
+    and not a # comment. Either must be an absolute path to a folder holding
+    covenant_unified_v8.py. A pin file inside this trader's own folder is
+    refused: the trader writes there."""
+    src, where = PINNED_COVENANT_HOME, "witness.PINNED_COVENANT_HOME"
+    if src is None:
+        where = PIN_FILE
+        try:
+            inside = os.path.commonpath([os.path.realpath(PIN_FILE), os.path.realpath(HERE)]) == os.path.realpath(HERE)
+        except ValueError:
+            inside = False
+        if inside:
+            return None, "the pin file %s is inside the trader's own folder" % PIN_FILE
+        try:
+            with open(PIN_FILE, encoding="utf-8") as fh:
+                lines = [l.strip() for l in fh.read().splitlines()]
+        except (OSError, ValueError) as e:
+            return None, "no pin in code and %s cannot be read (%s)" % (PIN_FILE, type(e).__name__)
+        lines = [l for l in lines if l and not l.startswith("#")]
+        if not lines:
+            return None, "%s names no folder" % PIN_FILE
+        src = lines[0]
+    if not isinstance(src, str) or not os.path.isabs(src):
+        return None, "the pin in %s is not an absolute path" % where
+    if not os.path.isfile(os.path.join(src, "covenant_unified_v8.py")):
+        return None, "the pinned folder (from %s) does not hold covenant_unified_v8.py" % where
+    return os.path.abspath(src), ""
+
+
+def home_reasons(cfg, hypothetical=False):
+    """Why an ARMED config's witness folder is refused; [] when it is not, and
+    always [] for a disarmed config (rehearsal) -- unless `hypothetical`, which
+    asks what would refuse it if it were armed, for the rehearsal notice."""
+    if not isinstance(cfg, dict) or not (cfg.get("armed") or hypothetical):
+        return []
+    pin, why = pinned_home()
+    if not pin:
+        return ["armed with no pinned witness folder (%s) -- refused. Write covenant's "
+                "absolute path as the one line of %s, a file this trader never writes; "
+                "an environment variable or trader_config.json cannot stand in for it "
+                "while armed" % (why, PIN_FILE)]
+    out = []
+    for label, val in (("env SENTINEL_COVENANT_HOME", os.environ.get("SENTINEL_COVENANT_HOME")),
+                       ("trader_config.json covenant_home", cfg.get("covenant_home"))):
+        if val and not _same_path(val, pin):
+            out.append("armed with a witness folder override (%s) that is not the pinned "
+                       "folder -- refused; no seal, approval, floor or halt is taken from "
+                       "it and no Python is run from it" % label)
+    return out
+
+
+def effective_home(cfg=None):
+    """The folder whose Python may be run for this config. Armed: the pinned
+    folder, or None when home_reasons(cfg) refuses. Disarmed: covenant_home(cfg),
+    as before."""
+    if isinstance(cfg, dict) and cfg.get("armed"):
+        if home_reasons(cfg):
+            return None
+        return pinned_home()[0]
+    return covenant_home(cfg)
+
+
 def reserve_path(cfg=None):
     """Covenant's private/RESERVE.json.
 
@@ -219,7 +311,11 @@ def _refused(detail):
 
 def seal_decision_result(cfg, record, runner=None):
     """Covenant's seal_decision_result, run in covenant. Same dict shape."""
-    home = covenant_home(cfg)
+    # H6: armed, only the pinned folder's Python is run.
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return _refused("witness: " + "; ".join(pin_why))
+    home = effective_home(cfg)
     if not home:
         return _refused("witness: covenant_home is not configured (env "
                         "SENTINEL_COVENANT_HOME or trader_config.json), so "
@@ -258,7 +354,11 @@ def terms_reasons(cfg):
 def daily_plan_gate_reasons(now=None, cfg=None, runner=None):
     """Covenant's covenant_daily_plan.gate_reasons(). [] means today's plan is
     approved; anything else is a reason no order may go live."""
-    home = covenant_home(cfg)
+    # H6: armed, only the pinned folder's Python is run.
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return ["daily plan gate unavailable (%s) -- nothing may go live" % "; ".join(pin_why)]
+    home = effective_home(cfg)
     if not home:
         return ["daily plan gate unavailable (covenant_home not configured) "
                 "-- nothing may go live"]
@@ -278,5 +378,7 @@ def daily_plan_gate_reasons(now=None, cfg=None, runner=None):
 if __name__ == "__main__":
     home = covenant_home()
     print("covenant_home :", home or "NOT CONFIGURED")
+    _pin, _why = pinned_home()
+    print("pinned (armed):", _pin or "NONE -- %s. An armed cycle will refuse." % _why)
     print("reserve file  :", reserve_path(), "(present)" if os.path.isfile(reserve_path()) else "(MISSING)")
     print("daily plan    :", daily_plan_gate_reasons() or "approved for today")

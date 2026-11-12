@@ -107,12 +107,13 @@ check("D3a under that file an UNSEALED order is refused as not sealed (it used t
       any("not sealed" in r for r in rs), rs)
 check("D3b ...and refused by Rule 5: 0 sealed signals, need 30 (it used to clear)",
       any(r.startswith("Rule 5") and "need 30" in r for r in rs), rs)
-satisfied = cfg_file({"armed": True, "armed_until": UNTIL, "daily_plan_required": False,
-                      "min_sealed_signals": 0, "rule5_require_significance": False})
-rs_ok = G.preconditions(ORDER, cfg=None, st=dict(FRESH), sealed_ok=True, guard_blocks=[],
-                        config_path=satisfied)
-check("D3c a config that states its own Rule 5 threshold, with the seal given, clears",
-      rs_ok == [], rs_ok)
+# The clearing half looks at these two gates only. An armed config read from
+# disk is also held to H6's armed terms and to the pinned witness folder; those
+# are test_h06_waivers_witness.py's subject, not this file's.
+rs_ok = G.preconditions(ORDER, cfg=None, st=dict(FRESH, sealed_signals=30, rule5={"clears": True}),
+                        sealed_ok=True, guard_blocks=[], config_path=minimal)
+check("D3c under the same minimal file, a SEALED order with a Rule 5 record that clears is not "
+      "refused by either gate", not any("not sealed" in r or r.startswith("Rule 5") for r in rs_ok), rs_ok)
 
 # ---- D4: the config handed in -----------------------------------------------------
 NO_CFG = os.path.join(TMP, "no_such_config.json")
@@ -186,6 +187,8 @@ check("D6d a config that simply leaves the caps out is NOT refused for it (it ta
 # ---- D7: the cycle -----------------------------------------------------------------
 home = tempfile.mkdtemp()
 open(os.path.join(home, "covenant_unified_v8.py"), "w").close()
+import witness as W          # noqa: E402
+W.PINNED_COVENANT_HOME = home          # H6: an armed config needs the folder pinned
 os.makedirs(os.path.join(home, "private"))
 rp = os.path.join(home, "private", "RESERVE.json")
 open(rp, "w").write("{}")

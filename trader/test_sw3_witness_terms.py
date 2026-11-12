@@ -94,6 +94,13 @@ def seal(home, executor_cfg=None, record=None):
 
 # ---- T1: the executor's cfg does not reach the seal -----------------------------
 home = fake_covenant()
+# H6 (2026-11-12): an ARMED config is now held to a PINNED witness folder -- one
+# named in code or in a file the trader never writes -- and a covenant_home in
+# the config alone is refused while armed. T1e-T1i and T5e-T5g hand the witness
+# an armed config naming `home`, so this suite pins `home` in code, which is
+# what an operator's pin does. What an armed config does WITHOUT a pin, or with
+# a different folder, is driven both ways in test_h06_waivers_witness.py.
+W.PINNED_COVENANT_HOME = home
 OUTSIDE_KEY = os.path.join(tempfile.mkdtemp(), "attacker.key")
 open(OUTSIDE_KEY, "w").close()
 

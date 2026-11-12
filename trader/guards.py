@@ -394,6 +394,56 @@ def trading_scope(cfg):
     return {"open_reserve_pct": float(pct), "by": s["by"], "at": s["at"], "words": s["words"]}
 
 
+# ---- H6 (2026-11-12): WHAT AN ARMED CONFIG MAY NOT SWITCH OFF -----------------
+# Three records and three switches in this trader's own gitignored config each
+# removed a gate: rule5_waiver removed Rule 5; trading_scope.open_reserve_pct
+# removed the 50% reserve on every coin but the hold-only three;
+# daily_plan_required=false removed the day's approval; min_sealed_signals
+# below the shipped 30 and rule5_require_significance=false removed Rule 5
+# without even a waiver record. (seal_required is SW3's, in witness.py.)
+#
+# A DISARMED run may keep all of them -- it is a rehearsal, it places nothing,
+# and it says REHEARSAL ONLY when it uses one. An ARMED config that carries
+# any of them is refused, with the reason. The waiver and the scope are not
+# deleted from the code or from anyone's config: they are records of what the
+# operator chose on 2026-10-05 and 2026-10-06, and they stop being honoured
+# with real orders until this section is changed, in the open, in this file.
+SHIPPED_RESERVE_PCT = 0.50
+SHIPPED_MIN_SEALED_SIGNALS = 30
+WAIVER_NOT_HONOURED = ("armed with a Rule 5 waiver -- a waiver is honoured in a disarmed "
+                       "rehearsal only; Rule 5 applies to every live order")
+
+
+def live_terms_reasons(cfg, hypothetical=False):
+    """Why an ARMED config is refused for what it switches off; [] when it is
+    not, and always [] for a disarmed config -- unless `hypothetical`, which
+    asks "what WOULD refuse this config if it were armed" for the rehearsal
+    notice. (A flag rather than a copy of the config with the arming switch
+    set: nothing on the trading path writes that switch, and test_f5 A2 scans
+    for the text.)"""
+    if not isinstance(cfg, dict) or not (cfg.get("armed") or hypothetical):
+        return []
+    out = []
+    if rule5_waiver(cfg) is not None:
+        out.append(WAIVER_NOT_HONOURED)
+    s = trading_scope(cfg)
+    if s is not None and s["open_reserve_pct"] < SHIPPED_RESERVE_PCT:
+        out.append("armed with trading_scope.open_reserve_pct %g, below the shipped reserve "
+                   "of %g -- refused; a reserve under the shipped floor is rehearsal-only"
+                   % (s["open_reserve_pct"], SHIPPED_RESERVE_PCT))
+    if cfg.get("daily_plan_required", True) is not True:
+        out.append("armed with daily_plan_required not true -- refused; no live order "
+                   "without the day's approval")
+    m = cfg.get("min_sealed_signals", SHIPPED_MIN_SEALED_SIGNALS)
+    if isinstance(m, bool) or not isinstance(m, int) or m < SHIPPED_MIN_SEALED_SIGNALS:
+        out.append("armed with min_sealed_signals %r, below the shipped Rule 5 minimum of %d "
+                   "-- refused" % (m, SHIPPED_MIN_SEALED_SIGNALS))
+    if cfg.get("rule5_require_significance", True) is not True:
+        out.append("armed with rule5_require_significance not true -- refused; the count "
+                   "alone is not Rule 5")
+    return out
+
+
 def open_reserve_pct(cfg, default=0.50):
     """The reserve on every coin that is not HOLD_ONLY: the scope's, or the
     rule before it. The ONE reading -- plan() and the status line both ask."""
@@ -1427,8 +1477,17 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     # for a config read from disk (load_config) and for one handed in. The cap
     # keys are left out of the fill for a handed-in config because they have
     # their own fallback through caps(config_path), below.
+    _from_disk = cfg is None
     cfg = (load_config(config_path) if cfg is None
            else with_defaults(cfg, skip=tuple(CAP_DEFAULTS)))
+    if _from_disk:
+        # H6: a config read from disk here (the path with no cycle around it)
+        # is held to the armed terms and the pinned witness folder. A caller
+        # that hands in its own cfg owes that check; covenant_trader.run_once
+        # makes it in witness_ready before anything else happens.
+        for r in live_terms_reasons(cfg) + witness.home_reasons(cfg):
+            if r not in bad:
+                bad.append(r)
     if st is None:
         st = load_trader_state(state_path)
     if st is None:
@@ -1520,11 +1579,20 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         bad.append("decision not sealed to the chain")
 
     min_sig = cfg.get("min_sealed_signals", 0)
-    if rule5_waiver(cfg) is not None:
+    _waiver = rule5_waiver(cfg)
+    if _waiver is not None and cfg.get("armed"):
+        # H6 (2026-11-12): ARMED, THE WAIVER IS NOT HONOURED. It is said, once,
+        # and Rule 5 is then applied below exactly as if no waiver were there.
+        if WAIVER_NOT_HONOURED not in bad:
+            bad.append(WAIVER_NOT_HONOURED)
+        _waiver = None
+    if _waiver is not None:
         # THE OPERATOR WAIVED RULE 5 (2026-10-05), by a record in his config,
         # not by deleting the check. The record is still computed, printed and
         # sealed every cycle; it simply stops refusing. Every other line in
         # this function still applies.
+        #
+        # H6: reached only DISARMED now -- a rehearsal, which places nothing.
         pass
     elif st.get("sealed_signals", 0) < min_sig:
         bad.append(f"Rule 5: {st.get('sealed_signals', 0)} sealed signals on "

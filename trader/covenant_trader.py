@@ -685,6 +685,19 @@ def plan(cfg, pf, week_spent=0.0):
     if total <= 0:
         return orders, ["portfolio total is zero -- nothing to plan"]
 
+    # H6 (2026-11-12): ARMED, THE RESERVE ON AN OPEN COIN MAY NOT BE UNDER THE
+    # SHIPPED 50%. The trading_scope record can set it to anything down to 0;
+    # disarmed that is a rehearsal and is planned as before. Armed, a reserve
+    # under the shipped floor plans nothing, here where the reserve is applied
+    # (run_once has already refused the cycle on the same reason).
+    if _guards is not None and cfg.get("armed"):
+        _s = _guards.trading_scope(cfg)
+        if _s is not None and _s["open_reserve_pct"] < _guards.SHIPPED_RESERVE_PCT:
+            return [], ["ARMED WITH A RESERVE UNDER THE SHIPPED FLOOR (trading_scope."
+                        "open_reserve_pct %g, shipped %g) -- planning NO orders. A reserve "
+                        "under the shipped floor is rehearsal-only; raise it or disarm."
+                        % (_s["open_reserve_pct"], _guards.SHIPPED_RESERVE_PCT)]
+
     # THE RESERVE. Every order this function can produce is a SELL, and the
     # guard stack is consulted for buys only ("a guard never stops a sale"),
     # so a reserve enforced there would never run. It is enforced HERE, on the
@@ -1142,11 +1155,31 @@ def witness_ready(cfg, reserve=None):
     today's quantities -- XRP's frozen floor included -- and the buy budget
     would re-anchor to today's book. Refusing the whole cycle is the only
     answer that writes nothing."""
-    if not witness.covenant_home(cfg):
+    # H6 (2026-11-12): an ARMED config is held to the pinned witness folder
+    # and may not carry a waiver, a reserve under the shipped floor, or a
+    # switched-off approval or Rule 5. Checked first: nothing below reads a
+    # folder that has not passed.
+    pin_why = witness.home_reasons(cfg)
+    if pin_why:
+        return "; ".join(pin_why)
+    if _guards is not None:
+        live_why = _guards.live_terms_reasons(cfg)
+        if live_why:
+            return "; ".join(live_why)
+    if not witness.effective_home(cfg):
         return ("covenant_home is not configured (env SENTINEL_COVENANT_HOME or "
                 "trader_config.json) -- the reserve floors, the seal and the "
                 "day's approval live in covenant")
     path = reserve or RESERVE_PATH
+    if isinstance(cfg, dict) and cfg.get("armed") and reserve is None:
+        # The floor file this process resolved when it started must be the
+        # pinned folder's. It is resolved from trader_config.json at import,
+        # so an armed config must name the pinned folder as covenant_home too.
+        want = os.path.join(witness.effective_home(cfg), "private", "RESERVE.json")
+        if os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.realpath(want)):
+            return ("armed, and the floor file this process resolved at start (%s) is not "
+                    "the pinned witness folder's (%s) -- refused; set covenant_home in "
+                    "trader_config.json to the pinned folder and start again" % (path, want))
     if not os.path.isfile(path):
         return ("covenant's reserve file is missing at %s -- Sentinel-Witness "
                 "never creates floors; restore it in covenant first" % path)
@@ -1165,6 +1198,23 @@ def witness_ready(cfg, reserve=None):
         if over:
             return "; ".join(over)
     return None
+
+
+def rehearsal_lines(cfg):
+    """What a DISARMED run prints when its config is looser than an armed one
+    may be. H6 (2026-11-12): the looser behaviour is kept for rehearsal, and
+    it is said to be that, every cycle, with each term named."""
+    if not isinstance(cfg, dict) or cfg.get("armed"):
+        return []
+    would = list(witness.home_reasons(cfg, hypothetical=True))
+    if _guards is not None:
+        would += _guards.live_terms_reasons(cfg, hypothetical=True)
+    if not would:
+        return []
+    out = ["  REHEARSAL ONLY -- disarmed, and this config would be REFUSED if armed:"]
+    out += ["    - " + w for w in would]
+    out.append("    Nothing below is a statement about what an armed cycle would do.")
+    return out
 
 
 def run_once(cfg, plan_only=False):
@@ -1208,6 +1258,9 @@ def run_once(cfg, plan_only=False):
 
     hr(f"COVENANT TRADER   {time.strftime('%Y-%m-%d %H:%M')}"
        + ("   [ARMED]" if cfg.get("armed") else "   [disarmed]"))
+
+    for line in rehearsal_lines(cfg):
+        print(line)
 
     nodes = node_status(cfg.get("node_ports") or [])
     print("  NODES")
@@ -1458,6 +1511,13 @@ def cmd_status(cfg):
     sc = _guards.trading_scope(cfg) if _guards else None
     print(f"  sell reserve       : {'%.0f%% of every coin but XRP/HBAR/LINK (trading_scope, %s on %s)' % (sc['open_reserve_pct'] * 100, sc['by'], sc['at']) if sc else '50% of every coin but XRP/HBAR/LINK (no trading_scope record)'}; XRP/HBAR/LINK: frozen floor")
     print(f"  covenant (witness) : {witness.covenant_home(cfg) or 'NOT CONFIGURED -- no cycle will run'}")
+    _pin, _pin_why = witness.pinned_home()                                         # H6
+    print(f"  witness pin (armed): {_pin or 'NONE -- ' + _pin_why + '; an armed cycle will refuse'}")
+    for line in rehearsal_lines(cfg):
+        print(line)
+    if cfg.get("armed"):
+        for why in witness.home_reasons(cfg) + (_guards.live_terms_reasons(cfg) if _guards else []):
+            print(f"  ARMED CONFIG REFUSED: {why}")
     print(f"  reserve floors     : {RESERVE_PATH} ({'present' if os.path.isfile(RESERVE_PATH) else 'MISSING -- no cycle will run'})")
     print(f"  orders placed today: {len(st.get('orders_today', []))}")
     wk = sum(float(r.get("usd", 0)) for r in st.get("fiat_buys", [])
