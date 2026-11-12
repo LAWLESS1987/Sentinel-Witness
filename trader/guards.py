@@ -35,11 +35,44 @@ DESIGN RULES
     threshold instead of guessing at the reason.
 """
 from __future__ import annotations
-import json, os, time
+import json, math, os, time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import witness   # Sentinel-Witness: covenant holds the floors, a halt, the day's approval
+
+
+# ---- H1 (2026-11-12): WHAT COUNTS AS AN AMOUNT -------------------------------
+# NaN fails every comparison. `nan < min` is False and `nan > room` is False, so
+# an order of NaN dollars was neither under the minimum nor over the cap and
+# went through both; a NaN row in the day's record made the day's total NaN,
+# and `nan >= cap` is False, so the day was never full. A negative row
+# subtracted from the day. This is the one reading of "a real amount", and every
+# sum and comparison of dollars below asks it: a number (never a bool, never a
+# string), finite, and above zero. Anything else is not skipped and not counted
+# as zero -- the caller refuses.
+def finite_number(x):
+    """x as a float when it is an int or float (not a bool) and finite; else None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    v = float(x)
+    return v if math.isfinite(v) else None
+
+
+def finite_positive(x):
+    """x as a float when it is a finite number above zero; else None."""
+    v = finite_number(x)
+    return v if v is not None and v > 0 else None
+
+
+def finite_nonnegative(x):
+    """x as a float when it is a finite number at or above zero; else None."""
+    v = finite_number(x)
+    return v if v is not None and v >= 0 else None
+
+
+BAD_AMOUNT = "order amount is not a finite number above zero"
+BAD_SIDE = "order side is not exactly 'buy' or 'sell'"
 
 
 @dataclass
@@ -112,6 +145,8 @@ class MaxDrawdown(Guard):
     def __init__(self, pct: float = 0.25):
         self.pct = pct
     def check(self, st, sym=None):
+        if finite_number(st.equity_peak) is None or finite_number(st.equity_now) is None:
+            return Verdict(False, self.name, "equity is not a finite number -- cannot evaluate, blocking")
         if st.equity_peak <= 0:
             return Verdict(False, self.name, "no peak recorded -- cannot evaluate, blocking")
         dd = (st.equity_peak - st.equity_now) / st.equity_peak
@@ -128,6 +163,9 @@ class DailyLossLimit(Guard):
     def __init__(self, pct: float = 0.08):
         self.pct = pct
     def check(self, st, sym=None):
+        if (finite_number(st.equity_start_of_day) is None
+                or finite_number(st.equity_now) is None):
+            return Verdict(False, self.name, "equity is not a finite number -- cannot evaluate, blocking")
         if st.equity_start_of_day <= 0:
             return Verdict(False, self.name, "no start-of-day equity -- blocking")
         chg = (st.equity_now - st.equity_start_of_day) / st.equity_start_of_day
@@ -153,6 +191,10 @@ class CooldownPeriod(Guard):
         t = st.last_sold.get(sym)
         if t is None:
             return Verdict(True, self.name, f"{sym} not sold recently")
+        if finite_number(t) is None or finite_number(st.now) is None:
+            return Verdict(False, self.name,
+                           f"{sym}: the time it was last sold is not a finite number "
+                           f"-- cannot evaluate, blocking")
         age = st.now - t
         if age < self.secs:
             return Verdict(False, self.name,
@@ -167,6 +209,12 @@ class LossStreak(Guard):
     def __init__(self, n: int = 4, window_days: float = 30):
         self.n, self.window = n, window_days * 86400
     def check(self, st, sym=None):
+        for t in st.closed_trades:
+            if (not isinstance(t, dict) or finite_number(t.get("closed_at", 0)) is None
+                    or finite_number(t.get("pnl", 0)) is None):
+                return Verdict(False, self.name,
+                               "a closed trade on record has a time or a result that is "
+                               "not a finite number -- cannot evaluate, blocking")
         recent = [t for t in st.closed_trades if st.now - t.get("closed_at", 0) <= self.window]
         losses = [t for t in recent if t.get("pnl", 0) < 0]
         if len(losses) >= self.n:
@@ -185,6 +233,8 @@ class ConcentrationCap(Guard):
         if sym is None:
             return Verdict(True, self.name, "not asset-specific")
         tot = st.total
+        if finite_number(tot) is None or finite_number(st.positions.get(sym, 0.0)) is None:
+            return Verdict(False, self.name, "portfolio value is not a finite number -- blocking")
         if tot <= 0:
             return Verdict(False, self.name, "no portfolio value -- blocking")
         w = st.positions.get(sym, 0.0) / tot
@@ -201,6 +251,8 @@ class CashFloor(Guard):
         self.pct = pct
     def check(self, st, sym=None):
         tot = st.total
+        if finite_number(tot) is None or finite_number(st.cash) is None:
+            return Verdict(False, self.name, "portfolio value is not a finite number -- blocking")
         if tot <= 0:
             return Verdict(False, self.name, "no portfolio value -- blocking")
         c = st.cash / tot
@@ -456,11 +508,16 @@ def fiat_buys_week_from(trader_state: Optional[dict], now: Optional[float] = Non
         return None
     out = []
     for r in got:
-        try:
-            if t - float(r.get("at", 0)) <= 7 * 86400:
-                out.append({"at": float(r.get("at", 0)), "usd": float(r["usd"])})
-        except (TypeError, ValueError, KeyError, AttributeError):
+        # H1: a row is a dict with a finite time and a finite amount above zero.
+        # Anything else makes the week UNKNOWN (None), and WeeklyBudget blocks
+        # on that; it is never dropped, and never counted as nothing.
+        if not isinstance(r, dict):
             return None
+        at, usd = finite_nonnegative(r.get("at")), finite_positive(r.get("usd"))
+        if at is None or usd is None:
+            return None
+        if t - at <= 7 * 86400:
+            out.append({"at": at, "usd": usd})
     return out
 
 
@@ -553,8 +610,8 @@ def bought_total_now(path: Optional[str] = None) -> Optional[float]:
     try:
         with open(p, encoding="utf-8") as fh:
             v = json.load(fh).get("bought_total_usd")
-        return float(v) if isinstance(v, (int, float)) and v >= 0 else None
-    except (OSError, ValueError, TypeError):
+        return finite_nonnegative(v)
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -567,9 +624,8 @@ def _proceeds(orders):
         if not isinstance(o, dict):
             return None
         side = str(o.get("side", "")).lower()
-        try:
-            usd = float(o.get("usd"))
-        except (TypeError, ValueError):
+        usd = finite_positive(o.get("usd"))     # H1: NaN, inf, zero, negative -> unknown
+        if usd is None:
             return None
         if side == "sell":
             sold += usd
@@ -592,10 +648,14 @@ def _spent(orders):
     for o in orders:
         if not isinstance(o, dict) or "usd" not in o:
             return None
-        try:
-            tot += float(o["usd"])
-        except (TypeError, ValueError):
+        # H1 (2026-11-12): finite and above zero, or the sum is unknown. NaN
+        # made the total NaN, which is not >= any cap; a negative row gave the
+        # day back room it had already used; a zero row is an order that was
+        # recorded for nothing, which no order this program places can be.
+        usd = finite_positive(o["usd"])
+        if usd is None:
             return None
+        tot += usd
     return tot
 
 
@@ -646,6 +706,7 @@ class PerDayCap(Guard):
         if spent is None:
             return Verdict(False, self.name,
                            f"one of today's {n} order(s) records no readable amount "
+                           f"(missing, not a number, not finite, or not above zero) "
                            f"-- the day's notional cannot be totalled, blocking")
         if spent >= self.max_notional:
             return Verdict(False, self.name,
@@ -743,8 +804,8 @@ def starting_total(path: Optional[str] = None) -> Optional[float]:
     try:
         with open(path or RESERVE_PATH, encoding="utf-8") as fh:
             v = json.load(fh).get("starting_total_usd")
-        return float(v) if isinstance(v, (int, float)) and v > 0 else None
-    except (OSError, ValueError, TypeError):
+        return finite_positive(v)
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -794,7 +855,7 @@ def set_starting_total(total: float, path: Optional[str] = None) -> Optional[flo
                     raise ValueError("RESERVE.json is not an object")
         except (OSError, ValueError):
             return None
-    if not (isinstance(total, (int, float)) and total > 0):
+    if finite_positive(total) is None:
         return None
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -868,7 +929,8 @@ class BuyBudget(Guard):
         gone, and this stops one from going past the end of it."""
         start = (st.starting_total_usd if st.starting_total_usd is not None
                  else starting_total(self._reserve_path))
-        if start is None or st.bought_total_usd is None:
+        if (finite_positive(start) is None
+                or finite_nonnegative(st.bought_total_usd) is None):
             return None
         return max(0.0, start * self.pct - float(st.bought_total_usd))
 
@@ -884,6 +946,11 @@ class BuyBudget(Guard):
             return Verdict(False, self.name,
                            "the cumulative amount already spent on buys is unknown "
                            "(no trader state could be read) -- cannot evaluate, blocking")
+        if finite_positive(start) is None or finite_nonnegative(st.bought_total_usd) is None:
+            # H1: NaN spent is not >= any budget, so it used to read as room left.
+            return Verdict(False, self.name,
+                           "the starting book or the cumulative amount spent on buys is "
+                           "not a finite number at or above zero -- cannot evaluate, blocking")
         budget = start * self.pct
         spent = float(st.bought_total_usd)
         if spent >= budget:
@@ -994,12 +1061,19 @@ class WeeklyBudget(Guard):
         if st.fiat_buys_week is None:
             return None
         total = 0.0
+        if finite_number(st.now) is None:
+            return None
         for r in st.fiat_buys_week:
-            try:
-                if st.now - float(r.get("at", 0)) <= self.WINDOW_S:
-                    total += float(r["usd"])
-            except (TypeError, ValueError, KeyError):
+            # H1: the same reading fiat_buys_week_from applies -- a row that is
+            # not a finite time and a finite amount above zero makes the week
+            # unknown, and check() blocks on that.
+            if not isinstance(r, dict):
                 return None
+            at, usd = finite_nonnegative(r.get("at")), finite_positive(r.get("usd"))
+            if at is None or usd is None:
+                return None
+            if st.now - at <= self.WINDOW_S:
+                total += usd
         return total
 
     def headroom(self, st) -> Optional[float]:
@@ -1230,8 +1304,20 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         if not v.allowed:
             bad.append(f"{v.guard}: {v.reason}")
     room = per_trade.largest_allowed(gs)
-    usd = float(order.get("usd") or 0.0)
-    if usd < _n("min_order_usd"):
+    # H1 (2026-11-12): THE ORDER'S OWN NUMBERS, BEFORE ANY COMPARISON. This was
+    # `float(order.get("usd") or 0.0)`: NaN is truthy, is not under the minimum
+    # and is not over the room, so an order of NaN dollars cleared both caps.
+    # A side that is not exactly "buy" or "sell" matters for the same reason:
+    # the guard stack is applied to `side == "buy"`, so "BUY" skipped it.
+    if order.get("side") not in ("buy", "sell"):
+        bad.append("%s (got %r) -- refusing" % (BAD_SIDE, order.get("side")))
+    if "qty" in order and finite_positive(order.get("qty")) is None:
+        bad.append("order quantity is not a finite number above zero (got %r) -- refusing"
+                   % (order.get("qty"),))
+    usd = finite_positive(order.get("usd"))
+    if usd is None:
+        bad.append("%s (got %r) -- refusing" % (BAD_AMOUNT, order.get("usd")))
+    elif usd < _n("min_order_usd"):
         bad.append(f"${usd:,.2f} under min_order_usd ${_n('min_order_usd'):,.2f}")
     elif room is not None and room > 0 and usd > room + 1e-9:
         # `room > 0` on purpose. When the day is fully used the two guards

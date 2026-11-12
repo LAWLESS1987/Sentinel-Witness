@@ -168,7 +168,15 @@ def roll_day(st):
         st["equity_start_of_day"] = 0.0     # set once equity is known this run
     # The trailing-week record of fiat-funded buys (R6 / guards.WeeklyBudget).
     cutoff = time.time() - 7 * 86400
-    st["fiat_buys"] = [r for r in st.get("fiat_buys", []) if float(r.get("at", 0)) >= cutoff]
+    # H1 (2026-11-12): ONLY A ROW THAT CAN BE READ AND IS OLD IS DROPPED. This
+    # was `float(r.get("at", 0)) >= cutoff`, and NaN is not >= anything, so a
+    # row whose time was NaN fell out of the week and its dollars with it. A
+    # row that cannot be read stays; guards.WeeklyBudget then says the week is
+    # unknown and blocks, which is what a bad row must do.
+    def _old(r):
+        at = _guards.finite_nonnegative(r.get("at")) if (_guards and isinstance(r, dict)) else None
+        return at is not None and at < cutoff
+    st["fiat_buys"] = [r for r in st.get("fiat_buys", []) if not _old(r)]
     # BACKFILL THE LIFETIME BUY TOTAL, BUT ONLY ON EVIDENCE.
     #
     # guards.BuyBudget measures cumulative buying against half the starting
@@ -307,6 +315,18 @@ def gather(cfg):
         except V.VenueError as e:
             venue_notes.append(f"{v.name}: {e}")
 
+    # H1 (2026-11-12): A BALANCE THAT IS NOT A FINITE NUMBER AT OR ABOVE ZERO
+    # is a venue that could not be read, not a holding of NaN units.
+    for vname in sorted(per_venue):
+        odd = [s for s, a in per_venue[vname].items()
+               if isinstance(a, bool) or not isinstance(a, (int, float))
+               or a != a or a in (float("inf"), float("-inf")) or a < 0]
+        if odd:
+            venue_notes.append("%s: balance for %s is not a finite number at or above "
+                               "zero -- this venue is treated as unread"
+                               % (vname, ", ".join(sorted(odd))))
+            del per_venue[vname]
+
     merged = {}
     for vname, bal in per_venue.items():
         for sym, amt in bal.items():
@@ -327,6 +347,13 @@ def gather(cfg):
         qty = sum(merged[s].values())
         if px is None:
             unpriced.append({"sym": s, "qty": qty, "why": why or "no price"})
+            continue
+        # H1: a price of NaN, infinity, zero or less is no price. NaN here made
+        # the position's value, the total and every share of it NaN.
+        if (isinstance(px, bool) or not isinstance(px, (int, float))
+                or px != px or px in (float("inf"), float("-inf")) or px <= 0):
+            unpriced.append({"sym": s, "qty": qty,
+                             "why": "price %r is not a finite number above zero" % (px,)})
             continue
         s200 = statistics.fmean(closes) if closes and len(closes) >= 50 else None
         positions.append({"sym": s, "qty": qty, "px": px, "val": qty * px,
@@ -704,7 +731,12 @@ def plan(cfg, pf, week_spent=0.0):
     # Shipped OFF (allow_fiat_buys false, budget 0). Every buy it emits is
     # fiat-funded, so FiatBuyPermission and BuyBudget apply to it unchanged.
     weekly = float(cfg.get("weekly_fiat_budget_usd") or 0.0)
-    if cfg.get("allow_fiat_buys") and weekly > 0:
+    if cfg.get("allow_fiat_buys") and weekly > 0 and week_spent is None:
+        # H1: unknown is not zero. A week that cannot be totalled buys nothing.
+        notes.append("R6 contribution: the week's record of dollar buys cannot be read "
+                     "(a row is missing, not finite or not above zero) -- nothing is "
+                     "contributed until it is repaired")
+    elif cfg.get("allow_fiat_buys") and weekly > 0:
         floor_pct = float(cfg.get("contribution_min_cash_pct", cfg.get("min_cash_pct", 0.10)))
         cash_after = pf["cash"] + sum(o["usd"] for o in _counted(orders))   # today's trims raise cash first
         spare = cash_after - floor_pct * total
@@ -775,6 +807,24 @@ def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks):
                                  guard_blocks=guard_blocks, caller="trader")
 
 
+def _malformed_order(o):
+    """Why this order is not one, or None. Symbol a non-empty string, side
+    exactly buy or sell, quantity and dollars each a finite number above zero."""
+    if not isinstance(o, dict):
+        return "order is not an object -- refusing"
+    if not isinstance(o.get("sym"), str) or not o["sym"].strip():
+        return "order names no symbol -- refusing"
+    if o.get("side") not in ("buy", "sell"):
+        return "order side is not exactly 'buy' or 'sell' (got %r) -- refusing" % (o.get("side"),)
+    for key, label in (("usd", "amount"), ("qty", "quantity")):
+        x = o.get(key)
+        if (isinstance(x, bool) or not isinstance(x, (int, float)) or x != x
+                or x in (float("inf"), float("-inf")) or x <= 0):
+            return ("order %s is not a finite number above zero (got %r) -- refusing"
+                    % (label, x))
+    return None
+
+
 def venue_for(order, live_venues):
     """Sell where the coins actually are. Largest holding wins a tie."""
     at = order.get("at") or {}
@@ -807,6 +857,15 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
+        # H1 (2026-11-12): AN ORDER THAT IS NOT WELL-FORMED REACHES NO VENUE,
+        # not even its dry-run endpoint. guards.preconditions refuses it too
+        # (so it could never go live); this stops it being handed to place()
+        # with a NaN quantity and booked in the day's record as "unknown".
+        malformed = _malformed_order(o)
+        if malformed:
+            results.append({**o, "status": "REFUSED", "detail": malformed,
+                            "blocked_by": [malformed]})
+            continue
         extra = []
         if o.get("side") == "buy" and may_buy is not None:
             try:
@@ -1022,8 +1081,11 @@ def run_once(cfg, plan_only=False):
             if not vd.allowed and vd.guard not in ("per_trade_cap", "per_day_cap"):
                 guard_blocks.append(vd.guard)
 
-    week_cut = time.time() - 7 * 86400
-    week_spent = sum(float(r.get("usd", 0)) for r in st.get("fiat_buys", []) if float(r.get("at", 0)) >= week_cut)
+    # H1 (2026-11-12): the week's spend is read by the guard's own reader, so a
+    # row that is NaN, negative or unreadable makes it UNKNOWN (None) rather
+    # than a NaN sum; plan() then contributes nothing this week and says why.
+    _week = _guards.fiat_buys_week_from(st) if _guards else None
+    week_spent = None if _week is None else sum(r["usd"] for r in _week)
     orders, notes = plan(cfg, pf, week_spent=week_spent)
     print("\n  PLAN")
     for n in notes:
