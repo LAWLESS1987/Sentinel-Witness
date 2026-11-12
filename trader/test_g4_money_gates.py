@@ -185,6 +185,17 @@ def main():
     import types as _types
     import witness as _W
     _home = _W.covenant_home()
+    # H6 (2026-11-12): an ARMED config is held to a PINNED witness folder, and
+    # the fixture below is armed. On a machine that has covenant (so that
+    # G4.4b runs at all) the gate would otherwise answer "unavailable (armed
+    # with no pinned witness folder)" -- a daily-plan refusal, but not the one
+    # G4.4b is about, which is whether the gate READS the operator's decision.
+    # So the folder this suite found is pinned in code for the length of the
+    # run, as test_sw3_witness_terms.py does. NOT EXERCISED where this change
+    # was made: that machine's harness has no covenant, so G4.4b said NOT RUN
+    # before and after it.
+    if _home:
+        _W.PINNED_COVENANT_HOME = _home
     _dp = _types.SimpleNamespace(APPROVALS=os.path.join(
         _home or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NO_COVENANT_HOME"),
         "ops", "daily_approvals.jsonl"))
