@@ -94,6 +94,13 @@ def seal(home, executor_cfg=None, record=None):
 
 # ---- T1: the executor's cfg does not reach the seal -----------------------------
 home = fake_covenant()
+# H6 (2026-11-12): an ARMED config is now held to a PINNED witness folder -- one
+# named in code or in a file the trader never writes -- and a covenant_home in
+# the config alone is refused while armed. T1e-T1i and T5e-T5g hand the witness
+# an armed config naming `home`, so this suite pins `home` in code, which is
+# what an operator's pin does. What an armed config does WITHOUT a pin, or with
+# a different folder, is driven both ways in test_h06_waivers_witness.py.
+W.PINNED_COVENANT_HOME = home
 OUTSIDE_KEY = os.path.join(tempfile.mkdtemp(), "attacker.key")
 open(OUTSIDE_KEY, "w").close()
 
@@ -233,7 +240,12 @@ try:
     T.seal_decision = lambda cfg, rec: touched.append("seal") or (False, "")
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        T.run_once({"covenant_home": home, "armed": True, "seal_required": False})
+        # H7 (2026-11-12): without an unexpired armed_until this config is
+        # DISARMED and the cycle would run as a rehearsal instead of meeting
+        # the term this check is about. It arms for one hour.
+        T.run_once({"covenant_home": home, "armed": True, "seal_required": False,
+                    "armed_until": T.time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   T.time.gmtime(T.time.time() + 3600))})
     check("T5g a real cycle, armed with the seal off: reads, plans, seals and saves NOTHING",
           not touched and "REFUSING THIS CYCLE" in out.getvalue() and "unwitnessed" in out.getvalue(),
           (touched, out.getvalue()[-200:]))

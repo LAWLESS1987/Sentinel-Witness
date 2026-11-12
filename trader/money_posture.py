@@ -194,8 +194,27 @@ def main() -> int:
     print("  Read-only. Reads no key, places nothing, arms nothing.")
 
     cfg, err = load_cfg()
-    armed = bool(cfg.get("armed"))
-    halted = os.path.exists(HALT)
+    # H7 (2026-11-12): an arming carries an expiry. `armed: true` with no
+    # armed_until, a malformed one, one more than 24 hours ahead or one that
+    # has passed is DISARMED, and guards.arming() is the one reading of that.
+    # If guards cannot be imported the config's own word is used, which errs
+    # toward reporting ARMED -- the direction this checker should err in.
+    arm_why = None
+    try:
+        import guards as _ga
+        armed, arm_why = _ga.arming(cfg)
+    except Exception:                                              # noqa: BLE001
+        armed = bool(cfg.get("armed"))
+    # H11 (2026-11-12): a halt file that cannot be looked at is treated by
+    # the trader as a halt (guards.path_state), and is reported here as that,
+    # not as "absent" -- which is what os.path.exists says about a path it
+    # could not examine.
+    try:
+        import guards as _gh
+        halt_state = _gh.path_state(HALT)
+    except Exception:                                              # noqa: BLE001
+        halt_state = "present" if os.path.exists(HALT) else "absent"
+    halted = halt_state != "absent"
 
     print()
     print("  THE ONE THAT DECIDES EVERYTHING")
@@ -207,8 +226,12 @@ def main() -> int:
     else:
         print("      armed : %s" % ("TRUE  <-- live orders CAN be booked" if armed
                                     else "false  -- every order is blocked here"))
+        if arm_why and (armed or cfg.get("armed")):
+            print("              %s" % arm_why)
     print("      halt file (TRADER_HALT) : %s"
-          % ("PRESENT -- everything blocked regardless" if halted else "absent"))
+          % ("absent" if not halted else "PRESENT -- everything blocked regardless"
+             if halt_state == "present" else
+             "COULD NOT BE CHECKED (%s) -- the trader treats that as a halt" % halt_state))
 
     # BOUNDS ARE REPORTED EVEN WITHOUT A CONFIG. This used to print nothing
     # when trader_config.json was absent -- which is the normal state, since

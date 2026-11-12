@@ -35,11 +35,142 @@ DESIGN RULES
     threshold instead of guessing at the reason.
 """
 from __future__ import annotations
-import json, os, time
+import datetime, json, math, os, time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import witness   # Sentinel-Witness: covenant holds the floors, a halt, the day's approval
+import key_scope  # H9/R1: what a venue's key may do -- judged there, no network code
+
+
+# ---- H1 (2026-11-12): WHAT COUNTS AS AN AMOUNT -------------------------------
+# NaN fails every comparison. `nan < min` is False and `nan > room` is False, so
+# an order of NaN dollars was neither under the minimum nor over the cap and
+# went through both; a NaN row in the day's record made the day's total NaN,
+# and `nan >= cap` is False, so the day was never full. A negative row
+# subtracted from the day. This is the one reading of "a real amount", and every
+# sum and comparison of dollars below asks it: a number (never a bool, never a
+# string), finite, and above zero. Anything else is not skipped and not counted
+# as zero -- the caller refuses.
+def finite_number(x):
+    """x as a float when it is an int or float (not a bool) and finite; else None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    v = float(x)
+    return v if math.isfinite(v) else None
+
+
+def finite_positive(x):
+    """x as a float when it is a finite number above zero; else None."""
+    v = finite_number(x)
+    return v if v is not None and v > 0 else None
+
+
+def finite_nonnegative(x):
+    """x as a float when it is a finite number at or above zero; else None."""
+    v = finite_number(x)
+    return v if v is not None and v >= 0 else None
+
+
+BAD_AMOUNT = "order amount is not a finite number above zero"
+BAD_SIDE = "order side is not exactly 'buy' or 'sell'"
+
+
+# ---- H11 (2026-11-12): "NOT THERE" IS ONLY EVER FileNotFoundError --------------
+# os.path.exists() answers False for a path it could not examine at all -- a
+# permission error, a drive that has gone away, a name the OS will not parse.
+# Two kinds of switch in this folder were built on it, and for both a False
+# was the PERMISSIVE answer:
+#
+#   * the halt:  `if os.path.exists(HALT)` -- a TRADER_HALT that could not be
+#     looked at read as "no halt", and orders went on;
+#   * "never run": `if not os.path.exists(state): return []` -- a state file
+#     that could not be looked at read as a trader that had never placed an
+#     order, so the day's count and the lifetime buy total were a known zero.
+#
+# path_state() is the one reading. "absent" is said only when the OS itself
+# says the name is not there; anything else that is not "present" is
+# "unknown: <why>", and every caller treats unknown as the refusing answer:
+# halted, or a state that exists and cannot be read.
+_lstat = os.lstat          # a test replaces this to make a path un-examinable
+
+
+def path_state(p):
+    """'present', 'absent', or 'unknown: <why>' for the path `p`. lstat, so a
+    directory entry of any kind named TRADER_HALT is a halt."""
+    try:
+        _lstat(p)
+        return "present"
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, ValueError, TypeError) as e:
+        return "unknown: %s" % type(e).__name__
+
+
+def _absent(p):
+    """True only when the OS says `p` is not there. Unknown is not absent."""
+    return path_state(p) == "absent"
+
+
+# ---- H4 (2026-11-12): THE CLOCK ONLY GOES FORWARD ----------------------------
+# The day rolled over whenever the stored date merely DIFFERED from today's.
+# Set the clock back a day, or cross a time zone westward near midnight, and
+# the stored day "differs": the day's order count was cleared, the daily caps
+# started again, and yesterday's approved plan was today's once more. So the
+# state keeps the latest local day and the latest moment this trader has seen
+# (last_seen_day, last_seen_at), only ever raised, and a clock that reads
+# earlier than either is a refusal, not a new day.
+CLOCK_BACK = "clock: the date or time reads EARLIER than this trader has already seen"
+CLOCK_SLACK_S = 300.0     # an ordinary time-sync correction is not a clock set back
+
+
+def local_day(now=None):
+    """The local calendar day, YYYY-MM-DD -- the one reading roll_day,
+    orders_today_from and covenant's daily plan (time.localtime) all use."""
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() if now is None else now))
+
+
+def is_day(s):
+    """True for a real calendar date written YYYY-MM-DD, and nothing else."""
+    if not isinstance(s, str) or len(s) != 10:
+        return False
+    try:
+        return time.strftime("%Y-%m-%d", time.strptime(s, "%Y-%m-%d")) == s
+    except ValueError:
+        return False
+
+
+def clock_back(trader_state, now=None):
+    """Why the clock reads earlier than the trader's own record, or None.
+
+    Reads `last_seen_day` and `day` (dates sort as text) and `last_seen_at`
+    (epoch seconds, with CLOCK_SLACK_S of tolerance). A `last_seen_day` or
+    `last_seen_at` that is present and is not a date or a finite number is a
+    reason too: the mark that says how far the clock has been cannot be read,
+    so it cannot be shown not to have gone back."""
+    if not isinstance(trader_state, dict):
+        return None
+    t = time.time() if now is None else now
+    if finite_number(t) is None:
+        return CLOCK_BACK + " (the time now is not a finite number)"
+    today = local_day(t)
+    lsd = trader_state.get("last_seen_day")
+    if lsd is not None and not is_day(lsd):
+        return CLOCK_BACK + " (last_seen_day %r in the trader's state is not a date)" % (lsd,)
+    seen = [d for d in (lsd, trader_state.get("day")) if is_day(d)]
+    if seen and today < max(seen):
+        return (CLOCK_BACK + ": today reads %s and the last day on record is %s. Nothing "
+                "runs until the date is at or after it; correct the clock" % (today, max(seen)))
+    lsa = trader_state.get("last_seen_at")
+    if lsa is not None:
+        at = finite_number(lsa)
+        if at is None:
+            return CLOCK_BACK + " (last_seen_at %r in the trader's state is not a finite number)" % (lsa,)
+        if t < at - CLOCK_SLACK_S:
+            return (CLOCK_BACK + ": the time now is %d s before the last cycle on record "
+                    "(more than the %d s allowed for a time-sync correction)"
+                    % (int(at - t), int(CLOCK_SLACK_S)))
+    return None
 
 
 @dataclass
@@ -112,6 +243,8 @@ class MaxDrawdown(Guard):
     def __init__(self, pct: float = 0.25):
         self.pct = pct
     def check(self, st, sym=None):
+        if finite_number(st.equity_peak) is None or finite_number(st.equity_now) is None:
+            return Verdict(False, self.name, "equity is not a finite number -- cannot evaluate, blocking")
         if st.equity_peak <= 0:
             return Verdict(False, self.name, "no peak recorded -- cannot evaluate, blocking")
         dd = (st.equity_peak - st.equity_now) / st.equity_peak
@@ -128,6 +261,9 @@ class DailyLossLimit(Guard):
     def __init__(self, pct: float = 0.08):
         self.pct = pct
     def check(self, st, sym=None):
+        if (finite_number(st.equity_start_of_day) is None
+                or finite_number(st.equity_now) is None):
+            return Verdict(False, self.name, "equity is not a finite number -- cannot evaluate, blocking")
         if st.equity_start_of_day <= 0:
             return Verdict(False, self.name, "no start-of-day equity -- blocking")
         chg = (st.equity_now - st.equity_start_of_day) / st.equity_start_of_day
@@ -153,6 +289,10 @@ class CooldownPeriod(Guard):
         t = st.last_sold.get(sym)
         if t is None:
             return Verdict(True, self.name, f"{sym} not sold recently")
+        if finite_number(t) is None or finite_number(st.now) is None:
+            return Verdict(False, self.name,
+                           f"{sym}: the time it was last sold is not a finite number "
+                           f"-- cannot evaluate, blocking")
         age = st.now - t
         if age < self.secs:
             return Verdict(False, self.name,
@@ -167,6 +307,12 @@ class LossStreak(Guard):
     def __init__(self, n: int = 4, window_days: float = 30):
         self.n, self.window = n, window_days * 86400
     def check(self, st, sym=None):
+        for t in st.closed_trades:
+            if (not isinstance(t, dict) or finite_number(t.get("closed_at", 0)) is None
+                    or finite_number(t.get("pnl", 0)) is None):
+                return Verdict(False, self.name,
+                               "a closed trade on record has a time or a result that is "
+                               "not a finite number -- cannot evaluate, blocking")
         recent = [t for t in st.closed_trades if st.now - t.get("closed_at", 0) <= self.window]
         losses = [t for t in recent if t.get("pnl", 0) < 0]
         if len(losses) >= self.n:
@@ -185,6 +331,8 @@ class ConcentrationCap(Guard):
         if sym is None:
             return Verdict(True, self.name, "not asset-specific")
         tot = st.total
+        if finite_number(tot) is None or finite_number(st.positions.get(sym, 0.0)) is None:
+            return Verdict(False, self.name, "portfolio value is not a finite number -- blocking")
         if tot <= 0:
             return Verdict(False, self.name, "no portfolio value -- blocking")
         w = st.positions.get(sym, 0.0) / tot
@@ -201,6 +349,8 @@ class CashFloor(Guard):
         self.pct = pct
     def check(self, st, sym=None):
         tot = st.total
+        if finite_number(tot) is None or finite_number(st.cash) is None:
+            return Verdict(False, self.name, "portfolio value is not a finite number -- blocking")
         if tot <= 0:
             return Verdict(False, self.name, "no portfolio value -- blocking")
         c = st.cash / tot
@@ -279,6 +429,120 @@ def trading_scope(cfg):
         if not isinstance(v, str) or not v.strip():
             return None
     return {"open_reserve_pct": float(pct), "by": s["by"], "at": s["at"], "words": s["words"]}
+
+
+# ---- H7 (2026-11-12): AN ARMING EXPIRES ---------------------------------------
+# `armed: true` was one click in SENTINEL_ARM_AND_RUN.bat and stayed true until
+# somebody remembered to edit it back: a trader armed for one cycle in October
+# was still armed in November. And `if not cfg.get("armed")` took any truthy
+# value -- the text "false" armed it.
+#
+# An arming is now the boolean true AND `armed_until`: an ISO-8601 time WITH
+# its zone (2026-11-12T21:00:00Z), in the future, and at most ARMED_MAX_S
+# ahead. Missing, malformed, zoneless, too far ahead or passed all mean
+# DISARMED, with the reason. arming() is the one reading; preconditions asks
+# it for every order, and covenant_trader.run_once runs the whole cycle as a
+# rehearsal when it says no.
+ARMED_MAX_S = 24 * 3600.0
+
+
+def parse_utc(s):
+    """Epoch seconds for an ISO-8601 time that carries its zone (a trailing Z
+    or +hh:mm), or None. A time with no zone is refused rather than guessed:
+    local and UTC differ by hours, and hours are what an expiry is made of."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    if t[-1] in "Zz":
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        return None
+    try:
+        return d.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def arming(cfg, now=None):
+    """(armed, why). armed is True only for a complete, unexpired arming."""
+    if not isinstance(cfg, dict) or not cfg.get("armed"):
+        return False, "armed=false in trader_config.json"
+    if cfg.get("armed") is not True:
+        return False, ("DISARMED: armed is %r in trader_config.json, not the boolean true"
+                       % (cfg.get("armed"),))
+    t = time.time() if now is None else now
+    if finite_number(t) is None:
+        return False, "DISARMED: the time now is not a finite number, so no expiry can be checked"
+    until = cfg.get("armed_until")
+    if until is None:
+        return False, ("DISARMED: armed=true but armed_until is missing -- an arming carries "
+                       "its own expiry (an ISO time with its zone, at most %d hours ahead)"
+                       % (ARMED_MAX_S // 3600))
+    at = parse_utc(until)
+    if at is None:
+        return False, ("DISARMED: armed_until %r is not an ISO-8601 time with its zone "
+                       "(for example 2026-11-12T21:00:00Z)" % (until,))
+    if at <= t:
+        return False, ("DISARMED: the arming expired at %s (%d minutes ago) -- arm again to "
+                       "place live orders" % (until, int((t - at) // 60)))
+    if at - t > ARMED_MAX_S:
+        return False, ("DISARMED: armed_until %s is %.1f hours ahead; an arming lasts at most "
+                       "%d hours" % (until, (at - t) / 3600.0, ARMED_MAX_S // 3600))
+    return True, "armed until %s" % until
+
+
+# ---- H6 (2026-11-12): WHAT AN ARMED CONFIG MAY NOT SWITCH OFF -----------------
+# Three records and three switches in this trader's own gitignored config each
+# removed a gate: rule5_waiver removed Rule 5; trading_scope.open_reserve_pct
+# removed the 50% reserve on every coin but the hold-only three;
+# daily_plan_required=false removed the day's approval; min_sealed_signals
+# below the shipped 30 and rule5_require_significance=false removed Rule 5
+# without even a waiver record. (seal_required is SW3's, in witness.py.)
+#
+# A DISARMED run may keep all of them -- it is a rehearsal, it places nothing,
+# and it says REHEARSAL ONLY when it uses one. An ARMED config that carries
+# any of them is refused, with the reason. The waiver and the scope are not
+# deleted from the code or from anyone's config: they are records of what the
+# operator chose on 2026-10-05 and 2026-10-06, and they stop being honoured
+# with real orders until this section is changed, in the open, in this file.
+SHIPPED_RESERVE_PCT = 0.50
+SHIPPED_MIN_SEALED_SIGNALS = 30
+WAIVER_NOT_HONOURED = ("armed with a Rule 5 waiver -- a waiver is honoured in a disarmed "
+                       "rehearsal only; Rule 5 applies to every live order")
+
+
+def live_terms_reasons(cfg, hypothetical=False):
+    """Why an ARMED config is refused for what it switches off; [] when it is
+    not, and always [] for a disarmed config -- unless `hypothetical`, which
+    asks "what WOULD refuse this config if it were armed" for the rehearsal
+    notice. (A flag rather than a copy of the config with the arming switch
+    set: nothing on the trading path writes that switch, and test_f5 A2 scans
+    for the text.)"""
+    if not isinstance(cfg, dict) or not (cfg.get("armed") or hypothetical):
+        return []
+    out = []
+    if rule5_waiver(cfg) is not None:
+        out.append(WAIVER_NOT_HONOURED)
+    s = trading_scope(cfg)
+    if s is not None and s["open_reserve_pct"] < SHIPPED_RESERVE_PCT:
+        out.append("armed with trading_scope.open_reserve_pct %g, below the shipped reserve "
+                   "of %g -- refused; a reserve under the shipped floor is rehearsal-only"
+                   % (s["open_reserve_pct"], SHIPPED_RESERVE_PCT))
+    if cfg.get("daily_plan_required", True) is not True:
+        out.append("armed with daily_plan_required not true -- refused; no live order "
+                   "without the day's approval")
+    m = cfg.get("min_sealed_signals", SHIPPED_MIN_SEALED_SIGNALS)
+    if isinstance(m, bool) or not isinstance(m, int) or m < SHIPPED_MIN_SEALED_SIGNALS:
+        out.append("armed with min_sealed_signals %r, below the shipped Rule 5 minimum of %d "
+                   "-- refused" % (m, SHIPPED_MIN_SEALED_SIGNALS))
+    if cfg.get("rule5_require_significance", True) is not True:
+        out.append("armed with rule5_require_significance not true -- refused; the count "
+                   "alone is not Rule 5")
+    return out
 
 
 def open_reserve_pct(cfg, default=0.50):
@@ -406,10 +670,28 @@ class ReserveFloor(Guard):
 # Four orders a day at the shipped $300 daily cap is $1,200 of notional a
 # month, which on a book this size is roughly 18% a year paid to the exchange
 # before any market move at all. The cap is a cost control, and a bug control.
+#
+# H5 (2026-11-12): THE SHIPPED DEFAULTS WERE $100 / $300 / 4 (the paragraph
+# above is written against them and is kept as the record of that). Every
+# document in this folder states $25 an order, $50 a day, 2 orders a day --
+# README "What has to say yes before a live order", MY_STRATEGY.md Rule 6
+# ("$25 per order"), rule5_waiver's own docstring, trader_config.example.json
+# -- so a config that left a cap out fell back to four times what was written
+# down. The defaults are now those documented numbers, and the same numbers
+# are HARD_CEILINGS: a config may LOWER a cap and may not raise one. A value
+# above a ceiling is refused with the reason (config_reasons); it is never
+# clamped, because a silently clamped number is a config that says one thing
+# while the program does another. Raising a ceiling is an edit to this file,
+# in the open, like HOLD_ONLY.
+HARD_CEILINGS = {
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
+}
 CAP_DEFAULTS = {
-    "max_order_usd": 100.0,
-    "max_daily_notional_usd": 300.0,
-    "max_orders_per_day": 4,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
     "min_order_usd": 5.0,
     # R6 contribution (2026-09-06): dollars the trader may put to work in any
     # trailing seven days. 0 is the shipped default and means NO contribution
@@ -421,6 +703,144 @@ CAP_DEFAULTS = {
 ALLOW_FIAT_KEY = "allow_fiat_buys"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "trader_config.json")
+
+# H5: THE WHOLE SHIPPED CONFIG, here because guards cannot import
+# covenant_trader (see TRADER_STATE below for the loop). It must equal
+# covenant_trader.DEFAULT_CONFIG; test_h05_config.py pins the two together.
+SHIPPED_DEFAULTS = {
+    "armed": False,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
+    "min_order_usd": 5.0,
+    "max_position_pct": 0.20,
+    "min_cash_pct": 0.10,
+    "seal_required": True,
+    "min_sealed_signals": 30,
+    "rule5_require_significance": True,
+    "allow_fiat_buys": False,
+    "weekly_fiat_budget_usd": 0.0,
+    "xrpl_record": False,
+    "xrpl_network": "testnet",
+    "xrpl_allow_mainnet": False,
+    "contribution_min_cash_pct": 0.10,
+    "contribution_symbols": [],
+    "node_ports": [5000],
+    "node_key": "covenant_A.db.key",
+    "loop_seconds": 3600,
+    "symbols": [],
+}
+
+
+def with_defaults(cfg, skip=()):
+    """`cfg` over the shipped defaults: a key the config leaves out takes the
+    shipped value, never "off". Keys in `skip` are left as the config has them.
+    Something that is not a dict is the shipped defaults alone (armed false)."""
+    out = {k: (list(v) if isinstance(v, list) else v)
+           for k, v in SHIPPED_DEFAULTS.items() if k not in skip}
+    if isinstance(cfg, dict):
+        out.update(cfg)
+    return out
+
+
+def config_reasons(cfg):
+    """Why this config is refused, as a list; [] when it is not. H5.
+
+    Each cap that is PRESENT must be a finite number above zero (a whole
+    number for the order count), and at or under its ceiling in
+    HARD_CEILINGS. A cap that is absent is not a reason: it takes the shipped
+    default, which is the ceiling. Nothing here changes a value."""
+    if not isinstance(cfg, dict):
+        return ["config: it is not an object"]
+    out = []
+    for key, ceiling in HARD_CEILINGS.items():
+        if key not in cfg:
+            continue
+        v = finite_positive(cfg[key])
+        if v is None:
+            out.append("config: %s is %r, not a finite number above zero -- refused"
+                       % (key, cfg[key]))
+        elif key == "max_orders_per_day" and v != int(v):
+            out.append("config: %s is %r, not a whole number -- refused" % (key, cfg[key]))
+        elif v > ceiling + 1e-9:
+            out.append("config: %s is %g, above the hard ceiling of %g set in code "
+                       "(guards.HARD_CEILINGS) -- refused, not clamped; a config may "
+                       "only lower it" % (key, v, ceiling))
+    if "min_order_usd" in cfg and finite_nonnegative(cfg["min_order_usd"]) is None:
+        out.append("config: min_order_usd is %r, not a finite number at or above zero "
+                   "-- refused" % (cfg["min_order_usd"],))
+    # R4 (2026-11-12): the other numbers that shape an order, each held on the
+    # side its own document states and no further (CONFIG_BOUNDS).
+    for key, (lo, lo_open, hi, hi_open, said) in CONFIG_BOUNDS.items():
+        if key not in cfg:
+            continue
+        v = finite_number(cfg[key])
+        if v is None:
+            out.append("config: %s is %r, not a finite number -- refused" % (key, cfg[key]))
+            continue
+        low_ok = v > lo if lo_open else v >= lo
+        high_ok = v < hi if hi_open else v <= hi
+        if not (low_ok and high_ok):
+            out.append("config: %s is %g, outside %s%g, %g%s -- the bound is set in code "
+                       "(guards.CONFIG_BOUNDS, from %s); refused, not clamped"
+                       % (key, v, "(" if lo_open else "[", lo, hi, ")" if hi_open else "]", said))
+    if ALLOW_FIAT_KEY in cfg and not isinstance(cfg[ALLOW_FIAT_KEY], bool):
+        out.append("config: %s is %r, not true or false -- refused; a permission is not "
+                   "granted by a value that merely looks like yes" % (ALLOW_FIAT_KEY, cfg[ALLOW_FIAT_KEY]))
+    for key in ("symbols", "contribution_symbols"):
+        if key in cfg and (not isinstance(cfg[key], list) or any(
+                not isinstance(x, str) or not x.strip() for x in cfg[key])):
+            out.append("config: %s is %r, not a list of symbols -- refused" % (key, cfg[key]))
+    return out
+
+
+# R4 (2026-11-12). Until now three caps had ceilings and every other number in
+# the config was the config's to set in either direction: max_position_pct 0.9
+# switched the concentration rule off, min_cash_pct 0 switched the cash sleeve
+# off, weekly_fiat_budget_usd 100000 was a budget. Each of these is held, in
+# code, on the side its own document states. (lowest, open?, highest, open?,
+# where the number is written.) A config may move a value INSIDE its range;
+# outside it the config is refused -- every cycle, armed or not -- not clamped.
+CONFIG_BOUNDS = {
+    # MY_STRATEGY.md Rule 1: "No single coin above 20% of your crypto total."
+    "max_position_pct": (0.0, True, 0.20, False, "MY_STRATEGY.md Rule 1: no single coin above 20%"),
+    # README, "What has to say yes": "the 10% cash floor"; MY_STRATEGY.md Rule 6.
+    "min_cash_pct": (0.10, False, 1.0, True, "README: the 10% cash floor"),
+    "contribution_min_cash_pct": (0.10, False, 1.0, True,
+                                  "MY_STRATEGY.md Rule 6: nothing is put to work under 10% cash"),
+    # MY_STRATEGY.md Rule 6: "a budget of 100 a week".
+    "weekly_fiat_budget_usd": (0.0, False, 100.0, False, "MY_STRATEGY.md Rule 6: a budget of 100 a week"),
+}
+
+# EVERY GATE-RELEVANT KEY (GATE_KEYS, below), and what holds it. Prose that a
+# test reads: test_r04_config_bounds.py fails if a key is added to GATE_KEYS
+# and not accounted for here.
+CONFIG_KEY_NOTES = {
+    "armed": "no bound: a boolean; counts only as the boolean true with an unexpired armed_until (H7)",
+    "armed_until": "bound: in the future and at most 24 hours ahead (guards.ARMED_MAX_S, H7)",
+    "max_order_usd": "bound: at most $25 (HARD_CEILINGS, H5); a config may lower it",
+    "max_daily_notional_usd": "bound: at most $50 (HARD_CEILINGS, H5); a config may lower it",
+    "max_orders_per_day": "bound: at most 2, a whole number (HARD_CEILINGS, H5); a config may lower it",
+    "min_order_usd": "no bound beyond finite and not negative: raising it only refuses more orders, "
+                     "lowering it only allows smaller ones inside the same caps",
+    "max_position_pct": "bound: above 0 and at most 0.20 (CONFIG_BOUNDS, R4)",
+    "min_cash_pct": "bound: at least 0.10 and below 1 (CONFIG_BOUNDS, R4)",
+    "seal_required": "bound when armed: must be true (witness.terms_reasons, SW3)",
+    "min_sealed_signals": "bound when armed: a whole number, at least 30 (live_terms_reasons, H6)",
+    "rule5_require_significance": "bound when armed: must be true (live_terms_reasons, H6)",
+    "daily_plan_required": "bound when armed: must be true (live_terms_reasons, H6)",
+    "rule5_waiver": "bound when armed: refused (live_terms_reasons, H6); honoured disarmed only",
+    "trading_scope": "bound when armed: open_reserve_pct at least 0.50 (live_terms_reasons, H6)",
+    "allow_fiat_buys": "no bound: a permission that is the operator's to give; must be exactly "
+                       "true or false (R4), and absent means no",
+    "weekly_fiat_budget_usd": "bound: 0 to $100 (CONFIG_BOUNDS, R4)",
+    "contribution_min_cash_pct": "bound: at least 0.10 and below 1 (CONFIG_BOUNDS, R4)",
+    "contribution_symbols": "no bound: it can only NARROW what the weekly contribution buys; "
+                            "must be a list of symbols (R4)",
+    "symbols": "no bound: it can only NARROW what is traded, and what it leaves out is still "
+               "counted in the book (R3); must be a list of symbols (R4)",
+    "covenant_home": "bound when armed: must be the pinned witness folder (witness.home_reasons, H6)",
+}
 
 
 def caps(path: Optional[str] = None) -> dict:
@@ -456,11 +876,16 @@ def fiat_buys_week_from(trader_state: Optional[dict], now: Optional[float] = Non
         return None
     out = []
     for r in got:
-        try:
-            if t - float(r.get("at", 0)) <= 7 * 86400:
-                out.append({"at": float(r.get("at", 0)), "usd": float(r["usd"])})
-        except (TypeError, ValueError, KeyError, AttributeError):
+        # H1: a row is a dict with a finite time and a finite amount above zero.
+        # Anything else makes the week UNKNOWN (None), and WeeklyBudget blocks
+        # on that; it is never dropped, and never counted as nothing.
+        if not isinstance(r, dict):
             return None
+        at, usd = finite_nonnegative(r.get("at")), finite_positive(r.get("usd"))
+        if at is None or usd is None:
+            return None
+        if t - at <= 7 * 86400:
+            out.append({"at": at, "usd": usd})
     return out
 
 
@@ -478,6 +903,12 @@ def orders_today_from(trader_state: Optional[dict], now: Optional[float] = None)
     if trader_state is None:
         return None
     if not isinstance(trader_state, dict):
+        return None
+    # H4: a clock that reads earlier than the record is not a new day. The
+    # day's orders are then UNKNOWN (None), and the cap guards block on that --
+    # where this used to answer [] ("a stale day, nothing placed") and hand the
+    # whole day's count back.
+    if clock_back(trader_state, now) is not None:
         return None
     day = time.strftime("%Y-%m-%d", time.localtime(now if now is not None else time.time()))
     if trader_state.get("day") != day:
@@ -499,7 +930,7 @@ def fiat_buys_week_now(path: Optional[str] = None, now: Optional[float] = None):
     Same contract as orders_today_now: a missing file is a KNOWN empty week
     (the trader has never run), a file that will not parse is unknown."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11: only a path the OS says is not there
         return []
     try:
         with open(p, encoding="utf-8") as fh:
@@ -517,7 +948,7 @@ def orders_today_now(path: Optional[str] = None, now: Optional[float] = None):
     order until the caps have already been used once. A file that exists but
     will not parse IS unknown, and that blocks."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return []
     try:
         with open(p, encoding="utf-8") as fh:
@@ -548,13 +979,13 @@ def bought_total_now(path: Optional[str] = None) -> Optional[float]:
     by a build that did not keep the total, and guessing zero for it would hand
     back a whole budget that may already have been spent."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return 0.0
     try:
         with open(p, encoding="utf-8") as fh:
             v = json.load(fh).get("bought_total_usd")
-        return float(v) if isinstance(v, (int, float)) and v >= 0 else None
-    except (OSError, ValueError, TypeError):
+        return finite_nonnegative(v)
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -567,12 +998,29 @@ def _proceeds(orders):
         if not isinstance(o, dict):
             return None
         side = str(o.get("side", "")).lower()
-        try:
-            usd = float(o.get("usd"))
-        except (TypeError, ValueError):
+        usd = finite_positive(o.get("usd"))     # H1: NaN, inf, zero, negative -> unknown
+        if usd is None:
             return None
         if side == "sell":
-            sold += usd
+            # H10 (2026-11-12): A SALE IS PROCEEDS ONLY FOR WHAT A VENUE HAS
+            # CONFIRMED FILLED. A row the trader writes now carries `fill`:
+            # UNCONFIRMED when the order is placed, then PARTIAL or CONFIRMED
+            # with `filled_usd` once the venue's own fills say so
+            # (covenant_trader.apply_fills). A resting limit order that never
+            # fills raised nothing, and used to count in full the moment it
+            # was placed. A row with no `fill` key was written before fills
+            # were tracked and counts as it always did; a `fill` this does not
+            # know makes the day unknown.
+            fill = o.get("fill")
+            if fill is None:
+                sold += usd
+            elif fill in ("UNCONFIRMED", "PARTIAL", "CONFIRMED"):
+                got = finite_nonnegative(o.get("filled_usd", 0.0))
+                if got is None:
+                    return None
+                sold += got
+            else:
+                return None
         elif side == "buy":
             bought += usd
         else:
@@ -592,10 +1040,14 @@ def _spent(orders):
     for o in orders:
         if not isinstance(o, dict) or "usd" not in o:
             return None
-        try:
-            tot += float(o["usd"])
-        except (TypeError, ValueError):
+        # H1 (2026-11-12): finite and above zero, or the sum is unknown. NaN
+        # made the total NaN, which is not >= any cap; a negative row gave the
+        # day back room it had already used; a zero row is an order that was
+        # recorded for nothing, which no order this program places can be.
+        usd = finite_positive(o["usd"])
+        if usd is None:
             return None
+        tot += usd
     return tot
 
 
@@ -635,6 +1087,11 @@ class PerDayCap(Guard):
                      else self._max_notional)
 
     def check(self, st, sym=None):
+        # H5: the numbers this guard was handed, against the ceilings in code.
+        over = config_reasons({"max_orders_per_day": self.max_orders,
+                               "max_daily_notional_usd": self.max_notional})
+        if over:
+            return Verdict(False, self.name, "; ".join(over))
         if st.orders_today is None:
             return Verdict(False, self.name,
                            "the day's orders are unknown (no trader state could be "
@@ -646,6 +1103,7 @@ class PerDayCap(Guard):
         if spent is None:
             return Verdict(False, self.name,
                            f"one of today's {n} order(s) records no readable amount "
+                           f"(missing, not a number, not finite, or not above zero) "
                            f"-- the day's notional cannot be totalled, blocking")
         if spent >= self.max_notional:
             return Verdict(False, self.name,
@@ -717,6 +1175,12 @@ class PerTradeCap(Guard):
         return max(0.0, min(self.max_usd, self.max_notional - spent))
 
     def check(self, st, sym=None):
+        # H5: as PerDayCap.check.
+        over = config_reasons({"max_order_usd": self.max_usd, "min_order_usd": self.min_usd,
+                               "max_orders_per_day": self.max_orders,
+                               "max_daily_notional_usd": self.max_notional})
+        if over:
+            return Verdict(False, self.name, "; ".join(over))
         room = self.largest_allowed(st)
         if room is None:
             why = ("the day's orders are unknown (no trader state could be read)"
@@ -743,8 +1207,8 @@ def starting_total(path: Optional[str] = None) -> Optional[float]:
     try:
         with open(path or RESERVE_PATH, encoding="utf-8") as fh:
             v = json.load(fh).get("starting_total_usd")
-        return float(v) if isinstance(v, (int, float)) and v > 0 else None
-    except (OSError, ValueError, TypeError):
+        return finite_positive(v)
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -787,14 +1251,14 @@ def set_starting_total(total: float, path: Optional[str] = None) -> Optional[flo
     # BuyBudget.check refuse with its existing "no starting book value
     # recorded" verdict, which is the fail-closed direction.
     p = path or RESERVE_PATH
-    if os.path.exists(p):
+    if not _absent(p):           # H11: present, or could not be examined
         try:
             with open(p, encoding="utf-8") as fh:
                 if not isinstance(json.load(fh), dict):
                     raise ValueError("RESERVE.json is not an object")
         except (OSError, ValueError):
             return None
-    if not (isinstance(total, (int, float)) and total > 0):
+    if finite_positive(total) is None:
         return None
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -868,7 +1332,8 @@ class BuyBudget(Guard):
         gone, and this stops one from going past the end of it."""
         start = (st.starting_total_usd if st.starting_total_usd is not None
                  else starting_total(self._reserve_path))
-        if start is None or st.bought_total_usd is None:
+        if (finite_positive(start) is None
+                or finite_nonnegative(st.bought_total_usd) is None):
             return None
         return max(0.0, start * self.pct - float(st.bought_total_usd))
 
@@ -884,6 +1349,11 @@ class BuyBudget(Guard):
             return Verdict(False, self.name,
                            "the cumulative amount already spent on buys is unknown "
                            "(no trader state could be read) -- cannot evaluate, blocking")
+        if finite_positive(start) is None or finite_nonnegative(st.bought_total_usd) is None:
+            # H1: NaN spent is not >= any budget, so it used to read as room left.
+            return Verdict(False, self.name,
+                           "the starting book or the cumulative amount spent on buys is "
+                           "not a finite number at or above zero -- cannot evaluate, blocking")
         budget = start * self.pct
         spent = float(st.bought_total_usd)
         if spent >= budget:
@@ -994,12 +1464,19 @@ class WeeklyBudget(Guard):
         if st.fiat_buys_week is None:
             return None
         total = 0.0
+        if finite_number(st.now) is None:
+            return None
         for r in st.fiat_buys_week:
-            try:
-                if st.now - float(r.get("at", 0)) <= self.WINDOW_S:
-                    total += float(r["usd"])
-            except (TypeError, ValueError, KeyError):
+            # H1: the same reading fiat_buys_week_from applies -- a row that is
+            # not a finite time and a finite amount above zero makes the week
+            # unknown, and check() blocks on that.
+            if not isinstance(r, dict):
                 return None
+            at, usd = finite_nonnegative(r.get("at")), finite_positive(r.get("usd"))
+            if at is None or usd is None:
+                return None
+            if st.now - at <= self.WINDOW_S:
+                total += usd
         return total
 
     def headroom(self, st) -> Optional[float]:
@@ -1104,14 +1581,22 @@ HALT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TRADER_HALT")
 
 
 def load_config(path: Optional[str] = None) -> dict:
-    """The whole trader config as a dict. Unreadable or malformed reads as {},
-    which makes `armed` false -- the posture allow_fiat_buys() already takes."""
+    """The whole trader config as a dict, OVER THE SHIPPED DEFAULTS.
+
+    H5 (2026-11-12). This returned the file's own keys and nothing else, so a
+    config that simply left `seal_required` and `min_sealed_signals` out had no
+    seal requirement and no Rule 5: preconditions() reads them with .get(), and
+    absent read as off. covenant_trader.load_config has always merged its
+    DEFAULT_CONFIG; this reader -- the one the sentinel path uses -- did not.
+
+    Unreadable or malformed still makes `armed` false: it reads as the shipped
+    defaults alone, which are disarmed."""
     try:
         with open(path or CONFIG_PATH, encoding="utf-8") as fh:
             cfg = json.load(fh)
-        return cfg if isinstance(cfg, dict) else {}
+        return with_defaults(cfg if isinstance(cfg, dict) else None)
     except (OSError, ValueError):
-        return {}
+        return with_defaults(None)
 
 
 def load_trader_state(path: Optional[str] = None):
@@ -1122,7 +1607,7 @@ def load_trader_state(path: Optional[str] = None):
     this the first time it runs, and treating "never run" as unknown would
     block every order until one had already been placed."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return {}
     try:
         with open(p, encoding="utf-8") as fh:
@@ -1178,22 +1663,58 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     caller       "trader" or "sentinel". Adds reasons, never removes them.
     """
     bad = []
-    cfg = load_config(config_path) if cfg is None else cfg
+    # H5: a key the config leaves out takes the SHIPPED value, never "off" --
+    # for a config read from disk (load_config) and for one handed in. The cap
+    # keys are left out of the fill for a handed-in config because they have
+    # their own fallback through caps(config_path), below.
+    _from_disk = cfg is None
+    cfg = (load_config(config_path) if cfg is None
+           else with_defaults(cfg, skip=tuple(CAP_DEFAULTS)))
+    if _from_disk:
+        # H6: a config read from disk here (the path with no cycle around it)
+        # is held to the armed terms and the pinned witness folder. A caller
+        # that hands in its own cfg owes that check; covenant_trader.run_once
+        # makes it in witness_ready before anything else happens.
+        for r in live_terms_reasons(cfg) + witness.home_reasons(cfg):
+            if r not in bad:
+                bad.append(r)
     if st is None:
         st = load_trader_state(state_path)
     if st is None:
         bad.append(STATE_UNREADABLE)
         st = {}
 
-    if not cfg.get("armed"):
-        bad.append("armed=false in trader_config.json")
-    if os.path.exists(HALT):
+    # H7: an arming is the boolean true with an unexpired armed_until, or it is
+    # not an arming. arming() says which, and why.
+    _armed, _arm_why = arming(cfg, now)
+    if not _armed:
+        bad.append(_arm_why)
+    # H4: said in its own words as well as through the caps going unknown.
+    _clock = clock_back(st, now)
+    if _clock:
+        bad.append(_clock)
+    # H11 (2026-11-12): A HALT THAT CANNOT BE LOOKED AT IS A HALT. These were
+    # os.path.exists(), which answers False for a path it could not examine.
+    _halt = path_state(HALT)
+    if _halt == "present":
         bad.append("TRADER_HALT file present")
+    elif _halt != "absent":
+        bad.append("TRADER_HALT could not be checked (%s) -- treated as a halt" % _halt)
     # A halt dropped in covenant stops this trader too: whoever reaches for
     # TRADER_HALT should not have to remember which folder trades now.
-    _cov_halt = witness.halt_path(cfg)
-    if _cov_halt and os.path.exists(_cov_halt):
-        bad.append("TRADER_HALT file present in covenant")
+    try:
+        _cov_halt = witness.halt_path(cfg)
+    except Exception as e:                                       # noqa: BLE001
+        _cov_halt = None
+        bad.append("TRADER_HALT in covenant could not be checked (%s) -- treated as a halt"
+                   % type(e).__name__)
+    if _cov_halt:
+        _halt = path_state(_cov_halt)
+        if _halt == "present":
+            bad.append("TRADER_HALT file present in covenant")
+        elif _halt != "absent":
+            bad.append("TRADER_HALT in covenant could not be checked (%s) -- treated as a halt"
+                       % _halt)
     # 7. THE DAY'S PLAN IS APPROVED (2026-09-12, the operator's decision: "i'll
     # have to daily approve of the strategy it lays out"). No order goes live
     # without a signed approve for TODAY's plan, matching its hash --
@@ -1216,7 +1737,20 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
 
     def _n(key):
         v = cfg.get(key)
-        return v if isinstance(v, (int, float)) else c[key]
+        return v if finite_number(v) is not None else c[key]
+
+    # H5: THE CEILINGS. The numbers about to be used -- the config's where it
+    # states them, the fallback's where it does not -- are checked against
+    # HARD_CEILINGS, and a number above one (or not a number) is a reason for
+    # THIS order, said in words. Nothing is clamped.
+    bad.extend(config_reasons({k: (cfg[k] if k in cfg else c[k])
+                               for k in ("max_order_usd", "max_daily_notional_usd",
+                                         "max_orders_per_day", "min_order_usd")}))
+    # R4: and every other bounded number in the config (CONFIG_BOUNDS), which
+    # have no fallback to resolve first.
+    for r in config_reasons(cfg):
+        if r not in bad:
+            bad.append(r)
 
     gs = State(equity_now=0.0, equity_peak=0.0, equity_start_of_day=0.0,
                closed_trades=[], last_sold={}, positions={}, cash=0.0,
@@ -1230,8 +1764,20 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         if not v.allowed:
             bad.append(f"{v.guard}: {v.reason}")
     room = per_trade.largest_allowed(gs)
-    usd = float(order.get("usd") or 0.0)
-    if usd < _n("min_order_usd"):
+    # H1 (2026-11-12): THE ORDER'S OWN NUMBERS, BEFORE ANY COMPARISON. This was
+    # `float(order.get("usd") or 0.0)`: NaN is truthy, is not under the minimum
+    # and is not over the room, so an order of NaN dollars cleared both caps.
+    # A side that is not exactly "buy" or "sell" matters for the same reason:
+    # the guard stack is applied to `side == "buy"`, so "BUY" skipped it.
+    if order.get("side") not in ("buy", "sell"):
+        bad.append("%s (got %r) -- refusing" % (BAD_SIDE, order.get("side")))
+    if "qty" in order and finite_positive(order.get("qty")) is None:
+        bad.append("order quantity is not a finite number above zero (got %r) -- refusing"
+                   % (order.get("qty"),))
+    usd = finite_positive(order.get("usd"))
+    if usd is None:
+        bad.append("%s (got %r) -- refusing" % (BAD_AMOUNT, order.get("usd")))
+    elif usd < _n("min_order_usd"):
         bad.append(f"${usd:,.2f} under min_order_usd ${_n('min_order_usd'):,.2f}")
     elif room is not None and room > 0 and usd > room + 1e-9:
         # `room > 0` on purpose. When the day is fully used the two guards
@@ -1246,11 +1792,20 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         bad.append("decision not sealed to the chain")
 
     min_sig = cfg.get("min_sealed_signals", 0)
-    if rule5_waiver(cfg) is not None:
+    _waiver = rule5_waiver(cfg)
+    if _waiver is not None and cfg.get("armed"):
+        # H6 (2026-11-12): ARMED, THE WAIVER IS NOT HONOURED. It is said, once,
+        # and Rule 5 is then applied below exactly as if no waiver were there.
+        if WAIVER_NOT_HONOURED not in bad:
+            bad.append(WAIVER_NOT_HONOURED)
+        _waiver = None
+    if _waiver is not None:
         # THE OPERATOR WAIVED RULE 5 (2026-10-05), by a record in his config,
         # not by deleting the check. The record is still computed, printed and
         # sealed every cycle; it simply stops refusing. Every other line in
         # this function still applies.
+        #
+        # H6: reached only DISARMED now -- a rehearsal, which places nothing.
         pass
     elif st.get("sealed_signals", 0) < min_sig:
         bad.append(f"Rule 5: {st.get('sealed_signals', 0)} sealed signals on "
@@ -1268,6 +1823,414 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
         bad.append("guards: " + ", ".join(guard_blocks))
 
     return bad + _caller_reasons(caller, order, guard_blocks)
+
+
+# ---- H8 (2026-11-12): THE APPROVAL BINDS THE ORDERS ---------------------------
+#
+# The daily plan gate above asks covenant one question: is today's plan
+# approved? On yes, covenant_trader.execute placed whatever plan() computed at
+# run time. Nothing compared the two. The operator approved a plan at 07:10
+# and the orders placed at 09:00 were the planner's of 09:00 -- usually the
+# same, never checked, and after a price move or a config edit, not the same.
+#
+# approval_reasons() holds ONE order to covenant's record of what was approved
+# (witness.approval_record). The rules are here, not in covenant, so that they
+# are in the repository that places the order and is tested for it:
+#
+#   * A DECLINE ANYWHERE IN THE DAY'S RECORD IS FINAL FOR THAT DAY. An approve
+#     row after it does not undo it.
+#   * AN APPROVAL LASTS APPROVAL_VALID_S (12 hours) from the moment it was
+#     given, and then it has expired. No document in this folder states a
+#     validity; the operator approves between about 07:00 and 11:20
+#     (test_g4_money_gates.py), and 12 hours keeps an order inside the day it
+#     was approved for.
+#   * THE ORDER MUST BE ONE OF THE PLAN'S PROPOSED ORDERS: the same symbol,
+#     the same side, and a size no larger than the proposed one and no more
+#     than APPROVAL_SIZE_TOLERANCE (2%) under it. A plan with no orders
+#     approves no orders.
+#   * EACH PROPOSED ORDER IS GOOD FOR ONE PLACEMENT. Orders already in today's
+#     record use up the proposed orders they match, so the same approved order
+#     cannot go out in two cycles on one day.
+APPROVAL_VALID_S = 12 * 3600.0
+APPROVAL_SIZE_TOLERANCE = 0.02
+APPROVAL_FUTURE_SLACK_S = 300.0
+APPROVAL_UNAVAILABLE = "approval binding unavailable"
+APPROVAL_DECLINED = "today's plan was DECLINED"
+
+
+def _approved_orders(approval):
+    """The record's proposed orders as [(SYM, side, usd)], or None if any is
+    not a symbol, a side and a finite amount above zero."""
+    rows = approval.get("orders")
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        sym, side, usd = r.get("sym"), r.get("side"), finite_positive(r.get("usd"))
+        if not isinstance(sym, str) or not sym.strip() or side not in ("buy", "sell") or usd is None:
+            return None
+        out.append((sym.strip().upper(), side, usd))
+    return out
+
+
+def _size_fits(usd, proposed):
+    """Never larger than proposed; at most the tolerance under it."""
+    return proposed * (1.0 - APPROVAL_SIZE_TOLERANCE) - 1e-9 <= usd <= proposed + 1e-9
+
+
+def approval_reasons(order, approval, orders_today=None, now=None):
+    """Why THIS order is not covered by today's approval. [] means it is."""
+    t = time.time() if now is None else now
+    if not isinstance(approval, dict) or approval.get("ok") is not True:
+        why = approval.get("why") if isinstance(approval, dict) else "no record"
+        return ["%s (%s) -- no order can be matched to an approval, so none goes live"
+                % (APPROVAL_UNAVAILABLE, str(why)[:200])]
+    if finite_number(t) is None:
+        return ["%s (the time now is not a finite number)" % APPROVAL_UNAVAILABLE]
+    today = local_day(t)
+    if approval.get("date") != today:
+        return ["%s (the record is for %r and today is %s)"
+                % (APPROVAL_UNAVAILABLE, approval.get("date"), today)]
+    plan_hash = approval.get("plan_hash")
+    decisions = approval.get("decisions")
+    if not isinstance(plan_hash, str) or not plan_hash.strip() or not isinstance(decisions, list):
+        return ["%s (the record carries no plan hash or no list of decisions)" % APPROVAL_UNAVAILABLE]
+    approved_at = []
+    for d in decisions:
+        if not isinstance(d, dict) or d.get("decision") not in ("approve", "decline"):
+            return ["%s (a decision row in the day's record cannot be read)" % APPROVAL_UNAVAILABLE]
+        if d["decision"] == "decline":
+            # FINAL. Whatever else the day's record holds, before or after.
+            return ["%s (%s) -- a decline is final for the day, whatever was approved "
+                    "before or after it" % (APPROVAL_DECLINED, today)]
+        at = finite_number(d.get("at"))
+        if at is None:
+            return ["%s (an approval in the day's record has no readable time)" % APPROVAL_UNAVAILABLE]
+        if d.get("plan_hash") == plan_hash:
+            approved_at.append(at)
+    if not approved_at:
+        return ["no approval on record for today's plan (hash %s...)" % plan_hash[:12]]
+    at = max(approved_at)
+    if at > t + APPROVAL_FUTURE_SLACK_S:
+        return ["%s (the approval is dated %d s in the future)" % (APPROVAL_UNAVAILABLE, int(at - t))]
+    if t - at > APPROVAL_VALID_S:
+        return ["today's approval has EXPIRED: it was given %.1f hours ago and lasts %d -- "
+                "approve the plan again" % ((t - at) / 3600.0, APPROVAL_VALID_S // 3600)]
+    proposed = _approved_orders(approval)
+    if proposed is None:
+        return ["%s (a proposed order in the approved plan cannot be read)" % APPROVAL_UNAVAILABLE]
+    sym = str(order.get("sym") or "").strip().upper()
+    side, usd = order.get("side"), finite_positive(order.get("usd"))
+    if not sym or side not in ("buy", "sell") or usd is None:
+        return ["the order is not one an approval can be matched to (symbol, side, amount)"]
+    if not proposed:
+        return ["the approved plan proposes NO orders, so it approves none -- %s %s $%.2f is not in it"
+                % (side, sym, usd)]
+    # What today's record has already used up.
+    free = list(proposed)
+    for row in orders_today or []:
+        if not isinstance(row, dict):
+            continue
+        r_sym = str(row.get("sym") or "").strip().upper()
+        r_usd = finite_positive(row.get("usd"))
+        if r_usd is None:
+            continue
+        for i, (p_sym, p_side, p_usd) in enumerate(free):
+            if p_sym == r_sym and p_side == row.get("side") and _size_fits(r_usd, p_usd):
+                del free[i]
+                break
+    same = [p for p in proposed if p[0] == sym and p[1] == side]
+    if not same:
+        return ["%s %s is not in the approved plan (it proposes: %s)"
+                % (side, sym, ", ".join("%s %s $%.2f" % (p[1], p[0], p[2]) for p in proposed))]
+    if any(_size_fits(usd, p[2]) for p in free if p[0] == sym and p[1] == side):
+        return []
+    if any(_size_fits(usd, p[2]) for p in same):
+        return ["%s %s $%.2f is in the approved plan, and today's record shows it already "
+                "placed -- one approved order is one placement" % (side, sym, usd)]
+    return ["%s %s $%.2f does not match the approved size (%s): an order may be no larger "
+            "than the one approved and at most %.0f%% under it"
+            % (side, sym, usd, ", ".join("$%.2f" % p[2] for p in same),
+               APPROVAL_SIZE_TOLERANCE * 100)]
+
+
+# ===========================================================================
+# R1 (2026-11-12): THE LIVE GATE TAKES NO DECISION FROM ITS CALLER.
+#
+# Review round one, confirmed by the outside reviewer: every check above is
+# made on the config dict and the state dict a caller hands in, plus three
+# things the caller simply asserts -- "it was sealed", "the guards did not
+# block", "here is what was approved". covenant_trader.run_once hands in the
+# truth. A Python caller that hands in {"armed": true, "armed_until": ...,
+# "daily_plan_required": false, "min_sealed_signals": 0} and sealed_ok=True
+# cleared all of it, and execute() went live on the result.
+#
+# live_gate() is the one thing that now turns "this order may go live" from
+# false to true, and it judges FROM DISK, itself:
+#
+#   * the config: trader_config.json, read here, over the shipped defaults --
+#     its caps and ceilings, its arming and expiry, the armed terms, the
+#     pinned witness folder. A config handed in is only COMPARED: if it
+#     differs from the file in any gate-relevant key, that is a refusal.
+#   * the state: the trader's state file, read here -- the day's count, the
+#     lifetime totals, the Rule 5 record, the clock marks. A state handed in
+#     is only compared, the same way.
+#   * the seal: witness.seal_reasons -- what THIS process has seen covenant
+#     admit, not a caller's True.
+#   * the approval: witness.approval_record, asked here.
+#   * the venue's key: key_scope.key_reasons, asked here.
+#   * the buy-side guards: evaluated here, on the caller's portfolio
+#     MEASUREMENTS (equity, positions, cash) and the disk state's history.
+#     A caller may add a block; it cannot remove one.
+#
+# When nothing refuses, the gate records a PERMIT in this module's own memory
+# -- one order, one venue, one use, PERMIT_VALID_S -- and returns its id. A
+# venue adapter's place(live=True) sends nothing without consuming one
+# (venues._live_permit), so calling the venue directly places nothing either.
+#
+# WHAT THIS IS NOT. It is not a defence against code running in this process
+# that reaches into this module's privates, replaces its functions, or edits
+# the files on disk: Python has no such boundary, and the files belong to the
+# same OS user. It closes the road the reviewer walked -- the public
+# functions' own arguments.
+# ===========================================================================
+GATE_KEYS = (
+    "armed", "armed_until", "max_order_usd", "max_daily_notional_usd", "max_orders_per_day",
+    "min_order_usd", "max_position_pct", "min_cash_pct", "seal_required", "min_sealed_signals",
+    "rule5_require_significance", "daily_plan_required", "rule5_waiver", "trading_scope",
+    "allow_fiat_buys", "weekly_fiat_budget_usd", "contribution_min_cash_pct",
+    "contribution_symbols", "symbols", "covenant_home")
+STATE_GATE_KEYS = ("day", "last_seen_day", "last_seen_at", "orders_today", "bought_total_usd",
+                   "fiat_buys", "sealed_signals", "rule5", "last_sold", "closed_trades",
+                   "equity_peak", "equity_start_of_day", "book")          # G2: the measured book too
+
+# G2 (review round 1, 2026-11-12). The buy-side guards -- drawdown, the day's loss, the cash
+# floor, concentration -- are arithmetic on the book: equity now, its peak, its value at the
+# start of the day, cash, positions. Until this change the gate took all of those from the
+# State its caller handed it, so a caller in the same process could hand over a healthy book
+# for an account that was down by half. The trader now records the book it measured in its
+# state file before it executes (covenant_trader.run_once), and the gate reads it from there.
+# What it is handed can only refuse: a portfolio that differs from the recorded book is a reason.
+BOOK_VALID_S = 300.0          # a recorded book older than this is not judged against
+
+
+def book_snapshot(state, now=None):
+    """The part of a measured State that the gate will judge a buy against, as it is written to
+    the state file."""
+    return {"at": time.time() if now is None else now,
+            "equity_now": state.equity_now, "cash": state.cash,
+            "positions": dict(state.positions or {})}
+
+
+def book_from_disk(dst, now=None):
+    """(book, None) from the trader's state as read from disk, or (None, why). `book` holds
+    equity_now, equity_peak, equity_start_of_day, cash and positions, every one a finite number
+    that makes sense; anything else is a refusal, never a default."""
+    snap = dst.get("book") if isinstance(dst, dict) else None
+    if not isinstance(snap, dict):
+        return None, "the trader's state file holds no measured book"
+    at, eq, cash = finite_number(snap.get("at")), finite_positive(snap.get("equity_now")), finite_nonnegative(snap.get("cash"))
+    pos = snap.get("positions")
+    if at is None or eq is None or cash is None or not isinstance(pos, dict) \
+            or any(not isinstance(k, str) or finite_nonnegative(v) is None for k, v in pos.items()):
+        return None, "the measured book in the trader's state file cannot be read"
+    t = time.time() if now is None else now
+    age = t - at
+    if not -CLOCK_SLACK_S <= age <= BOOK_VALID_S:
+        return None, "the measured book in the trader's state file is %d s old (limit %d)" % (age, BOOK_VALID_S)
+    peak, start = finite_positive(dst.get("equity_peak")), finite_positive(dst.get("equity_start_of_day"))
+    if peak is None or start is None:
+        return None, "the trader's state file holds no equity peak or no start-of-day equity"
+    if eq > peak * (1.0 + 1e-9):
+        return None, "the measured book is larger than the peak on record, which only ever rises"
+    return {"equity_now": eq, "equity_peak": peak, "equity_start_of_day": start, "cash": cash,
+            "positions": {k: float(v) for k, v in pos.items()}}, None
+
+
+def _book_differs(portfolio, book):
+    """Which of the caller's book numbers differ from the recorded book."""
+    def near(a, b):
+        a, b = finite_number(a), finite_number(b)
+        return a is not None and b is not None and abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
+    out = [k for k in ("equity_now", "cash") if not near(getattr(portfolio, k, None), book[k])]
+    mine = getattr(portfolio, "positions", None)
+    if not isinstance(mine, dict) or set(mine) != set(book["positions"]) \
+            or any(not near(mine[k], book["positions"][k]) for k in mine):
+        out.append("positions")
+    return out
+PERMIT_VALID_S = 120.0
+_PERMITS = {}
+
+
+def _same_value(a, b):
+    """Equal as config or state values: numbers by value (25 and 25.0), a bool
+    only with a bool, anything else by its JSON."""
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    if num(a) and num(b):
+        return float(a) == float(b)
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    try:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+
+
+def config_differs(handed, disk):
+    """The gate-relevant keys in which a config handed in differs from the one
+    on disk (both over the shipped defaults). [] when it does not."""
+    a = with_defaults(handed if isinstance(handed, dict) else None)
+    b = with_defaults(disk if isinstance(disk, dict) else None)
+    return [k for k in GATE_KEYS if not _same_value(a.get(k), b.get(k))]
+
+
+def state_differs(handed, disk):
+    """The gate-relevant keys in which a state handed in differs from the
+    state file. [] when it does not."""
+    a = handed if isinstance(handed, dict) else {}
+    b = disk if isinstance(disk, dict) else {}
+    return [k for k in STATE_GATE_KEYS if not _same_value(a.get(k), b.get(k))]
+
+
+def _issue_permit(venue_name, sym, side, usd):
+    """Record a permit for one live order and return its id. Called by
+    live_gate when nothing refused, and by nothing else in this program."""
+    import secrets
+    now = time.time()
+    for k in [k for k, p in _PERMITS.items() if p["used"] or p["expires"] < now]:
+        del _PERMITS[k]
+    pid = secrets.token_hex(16)
+    _PERMITS[pid] = {"venue": str(venue_name), "sym": str(sym).strip().upper(),
+                     "side": str(side), "usd": float(usd), "expires": now + PERMIT_VALID_S,
+                     "used": False}
+    return pid
+
+
+def consume_permit(pid, venue_name, sym, side):
+    """The declared dollars permit `pid` covers, marking it used. ValueError
+    when there is no such permit for this venue, symbol and side, or it has
+    been used or has expired."""
+    p = _PERMITS.get(pid) if isinstance(pid, str) else None
+    if p is None:
+        raise ValueError("there is no such permit")
+    if p["used"]:
+        raise ValueError("the permit has already been used")
+    if time.time() > p["expires"]:
+        raise ValueError("the permit has expired")
+    if (p["venue"], p["sym"], p["side"]) != (str(venue_name), str(sym).strip().upper(), str(side)):
+        raise ValueError("the permit is for another order")
+    p["used"] = True
+    return p["usd"]
+
+
+def live_gate(order, venue, cfg=None, st=None, portfolio=None, caller_blocks=None):
+    """(reasons, permit). `permit` is an id only when `reasons` is empty.
+
+    order          {"sym", "side", "usd", "qty"}
+    venue          the adapter the order would go to (asked about its key)
+    cfg, st        what the caller holds -- COMPARED with disk, never judged
+    portfolio      a guards.State of the book as the caller measured it; needed
+                   for a buy, whose guards are evaluated here
+    caller_blocks  reasons the caller wants added. Append only.
+
+    Reads the clock, the config, the state, the witness and the venue itself.
+    There is deliberately no `now`, no `sealed_ok`, no `approval` and no path
+    argument: each would be a decision, or a way to choose one."""
+    reasons = []
+    name = getattr(venue, "name", None)
+    if venue is None or not isinstance(name, str):
+        return ["live gate: no venue to send the order to"], None
+
+    # -- the config, from disk -------------------------------------------------
+    cstate = path_state(CONFIG_PATH)
+    if cstate == "absent":
+        reasons.append("live gate: there is no trader_config.json on disk (%s), so nothing "
+                       "is armed" % CONFIG_PATH)
+    disk = load_config(CONFIG_PATH)
+    if cfg is not None:
+        diff = config_differs(cfg, disk)
+        if diff:
+            reasons.append("live gate: the config handed in differs from trader_config.json on "
+                           "disk in %s -- refused; the gate judges the file, not what it is "
+                           "handed" % ", ".join(diff))
+
+    # -- the state, from disk ---------------------------------------------------
+    dst = load_trader_state(TRADER_STATE)
+    if dst is None:
+        dst = {}                      # preconditions below says STATE_UNREADABLE
+    elif st is not None:
+        diff = state_differs(st, dst)
+        if diff:
+            reasons.append("live gate: the state handed in differs from the trader's state "
+                           "file in %s -- refused; the day's count is read from the file"
+                           % ", ".join(diff))
+
+    # -- the seal, from what this process saw covenant admit ---------------------
+    try:
+        seal_why = list(witness.seal_reasons(order))
+    except Exception as e:                                       # noqa: BLE001
+        seal_why = ["seal: could not be checked (%s)" % type(e).__name__]
+
+    # -- the buy-side guards, evaluated here -------------------------------------
+    blocks = []
+    if order.get("side") == "buy":
+        if not isinstance(portfolio, State):
+            reasons.append("live gate: no portfolio was supplied, so the buy-side guards (cash "
+                           "floor, concentration, budgets) could not be evaluated")
+        else:
+            import dataclasses
+            measured, book_why = book_from_disk(dst)             # G2: the book is read, not handed in
+            if measured is None:
+                reasons.append("live gate: %s, so the buy-side guards (drawdown, the day's loss, "
+                               "cash floor, concentration) could not be evaluated -- refused" % book_why)
+                blocks = ["no measured book on record"]
+            else:
+                off = _book_differs(portfolio, measured)
+                if off:
+                    reasons.append("live gate: the portfolio handed in differs from the book the "
+                                   "trader recorded in %s -- refused; the gate judges the record"
+                                   % ", ".join(off))
+                book = dataclasses.replace(
+                    portfolio, equity_now=measured["equity_now"], equity_peak=measured["equity_peak"],
+                    equity_start_of_day=measured["equity_start_of_day"], cash=measured["cash"],
+                    positions=dict(measured["positions"]),
+                    orders_today=orders_today_from(dst),
+                    bought_total_usd=dst.get("bought_total_usd"),
+                    fiat_buys_week=fiat_buys_week_from(dst),
+                    last_sold=dict(dst.get("last_sold") or {}),
+                    closed_trades=list(dst.get("closed_trades") or []),
+                    starting_total_usd=None, now=time.time())
+                try:
+                    ok, blocking, _all = GuardStack().may_buy(book, order.get("sym"))
+                    blocks = [] if ok else [b.guard for b in blocking]
+                except Exception as e:                           # noqa: BLE001
+                    blocks = ["guards unavailable (%s)" % type(e).__name__]
+        blocks += [str(b) for b in (caller_blocks or [])]
+
+    # -- everything preconditions knows, on the DISK config and DISK state --------
+    for r in preconditions(order, cfg=None, st=None, sealed_ok=not seal_why,
+                           guard_blocks=blocks, caller="trader",
+                           config_path=CONFIG_PATH, state_path=TRADER_STATE):
+        if r not in reasons:
+            reasons.append(r)
+    for r in witness.terms_reasons(disk) + seal_why:
+        if r not in reasons:
+            reasons.append(r)
+
+    # -- the approval and the key: asked only for an order still standing ----------
+    if not reasons:
+        try:
+            record = witness.approval_record(cfg=disk)
+        except Exception as e:                                   # noqa: BLE001
+            record = {"ok": False, "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
+        reasons += approval_reasons(order, record, orders_today_from(dst))
+    if not reasons:
+        reasons += key_scope.key_reasons(venue)
+    if reasons:
+        return reasons, None
+    return [], _issue_permit(name, order["sym"], order["side"], order["usd"])
 
 
 # ---- WHICH REASONS ARE A DECISION, AND WHICH ARE THE ABSENCE OF ONE --------

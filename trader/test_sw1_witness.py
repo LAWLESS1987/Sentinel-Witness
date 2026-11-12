@@ -54,8 +54,17 @@ def fake_covenant():
     return d
 
 
+# H7 (2026-11-12): AN ARMING NOW CARRIES AN EXPIRY. guards.arming() reads
+# `armed: true` as armed only with an `armed_until` that is an ISO time with
+# its zone, in the future and at most 24 hours ahead; without one the config
+# is DISARMED and every fixture below that arms would be refused for that
+# alone. So the fixtures arm for one hour from now. Nothing else about any
+# check is changed; the expiry itself is driven in test_h07_arming.py.
+_ARMED_UNTIL = T.time.strftime("%Y-%m-%dT%H:%M:%SZ", T.time.gmtime(T.time.time() + 3600))
+
+
 def base_cfg(**over):
-    c = {"armed": True, "daily_plan_required": False, "max_order_usd": 25.0,
+    c = {"armed": True, "armed_until": _ARMED_UNTIL, "daily_plan_required": False, "max_order_usd": 25.0,
          "min_order_usd": 5.0, "max_orders_per_day": 2, "max_daily_notional_usd": 50.0,
          "seal_required": False, "min_sealed_signals": 30,
          "rule5_require_significance": True}
@@ -93,17 +102,23 @@ check("W1c a cfg that is not a dict is no waiver, not a crash", G.rule5_waiver(N
 
 # ---- W2: it waives Rule 5 and nothing else -------------------------------------
 without = reasons(base_cfg())
-withw = reasons(base_cfg(rule5_waiver=WAIVER))
+# H6 (2026-11-12): THE WAIVER IS HONOURED IN A DISARMED REHEARSAL ONLY. W2b and
+# W2d drove it with armed=true, which is exactly what guards.preconditions now
+# refuses ("armed with a Rule 5 waiver"). Both are restated on a disarmed
+# config -- the only place the waiver still lifts Rule 5 -- and the armed half
+# is driven both ways in test_h06_waivers_witness.py. W2e-W2i are unchanged:
+# they assert what the waiver does NOT lift, which holds armed or not.
+withw = reasons(base_cfg(armed=False, rule5_waiver=WAIVER))
 check("W2a without a waiver, 7 of 30 signals refuses in Rule 5's own words",
       rule5_in(without), without)
-check("W2b with the waiver, Rule 5 no longer refuses", not rule5_in(withw), withw)
+check("W2b DISARMED (a rehearsal), with the waiver, Rule 5 no longer refuses", not rule5_in(withw), withw)
 sig = base_cfg(min_sealed_signals=0, rule5_waiver=dict(WAIVER, waived=False))
 check("W2c ...and the significance half is waived the same way: count met, record "
       "not clear, refused without the waiver",
       rule5_in(reasons(sig, st={"orders_today": [], "sealed_signals": 9,
                                 "rule5": {"clears": False, "why": "0/9 wins"}})))
-check("W2d ...and cleared with it",
-      not rule5_in(reasons(base_cfg(min_sealed_signals=0, rule5_waiver=WAIVER),
+check("W2d ...and cleared with it, disarmed",
+      not rule5_in(reasons(base_cfg(armed=False, min_sealed_signals=0, rule5_waiver=WAIVER),
                            st={"orders_today": [], "sealed_signals": 9,
                                "rule5": {"clears": False, "why": "0/9 wins"}})))
 over = {"side": "buy", "usd": 40.0, "sym": "XLM"}

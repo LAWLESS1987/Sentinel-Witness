@@ -238,8 +238,13 @@ with open(guards.TRADER_STATE, "w", encoding="utf-8") as _fh:
     json.dump({"day": time.strftime("%Y-%m-%d"), "orders_today": [],
                "bought_total_usd": 0.0}, _fh)
 with open(guards.CONFIG_PATH, "w", encoding="utf-8") as _fh:
-    json.dump({"allow_fiat_buys": True, "max_order_usd": 100.0,
-               "max_daily_notional_usd": 300.0, "max_orders_per_day": 4,
+    # H5 (2026-11-12): this fixture wrote $100 / $300 / 4, the shipped defaults
+    # of the day. guards.HARD_CEILINGS refuses a cap above $25 / $50 / 2, and
+    # the two cap guards now block on such a config, so E9 and E13b ("a
+    # healthy book is allowed to add") went red on the fixture, not on the
+    # circuit breakers they are about. The caps here are the ceilings.
+    json.dump({"allow_fiat_buys": True, "max_order_usd": 25.0,
+               "max_daily_notional_usd": 50.0, "max_orders_per_day": 2,
                "min_order_usd": 5.0}, _fh)
 s0 = daily.load_state()
 check("S1 a missing state file loads as empty, not an exception",

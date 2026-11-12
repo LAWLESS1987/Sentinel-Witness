@@ -55,6 +55,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "trader_config.json")
@@ -79,6 +80,98 @@ def covenant_home(cfg=None):
     return os.path.abspath(home)
 
 
+# ---- H6 (2026-11-12): WHEN ARMED, THE WITNESS FOLDER IS PINNED ----------------
+# covenant_home() above takes the folder from an environment variable, else
+# from this trader's own gitignored config. That folder supplies the Python
+# that seals, the Python that answers "is today approved", the floor file and
+# the halt file -- so whoever could set one variable or edit one line chose
+# the witness, its interpreter (_python runs <home>/.venv) and its answers.
+#
+# A DISARMED run may still do that: it is a rehearsal, places nothing, and the
+# copied suites depend on it. An ARMED run may not. Armed, the folder must be
+# the one pinned in code (PINNED_COVENANT_HOME) or in PIN_FILE -- a file in a
+# folder this trader never writes to -- and an environment or config value
+# that names any other folder refuses. No Python is run from a folder that is
+# not the pin while armed (effective_home, used by the seal and the gate).
+#
+# WHAT THIS DOES NOT DO: the pin file belongs to the same OS user. It closes
+# the one-line road (an env var, a config edit), not the account.
+PINNED_COVENANT_HOME = None
+PIN_FILE = os.path.join(os.path.expanduser("~"), ".sentinel_witness", "covenant_home.pin")
+
+
+def _same_path(a, b):
+    try:
+        return (os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b)))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def pinned_home():
+    """(the pinned covenant folder, "") or (None, why there is none).
+
+    The code constant wins; else the first line of PIN_FILE that is not blank
+    and not a # comment. Either must be an absolute path to a folder holding
+    covenant_unified_v8.py. A pin file inside this trader's own folder is
+    refused: the trader writes there."""
+    src, where = PINNED_COVENANT_HOME, "witness.PINNED_COVENANT_HOME"
+    if src is None:
+        where = PIN_FILE
+        try:
+            inside = os.path.commonpath([os.path.realpath(PIN_FILE), os.path.realpath(HERE)]) == os.path.realpath(HERE)
+        except ValueError:
+            inside = False
+        if inside:
+            return None, "the pin file %s is inside the trader's own folder" % PIN_FILE
+        try:
+            with open(PIN_FILE, encoding="utf-8") as fh:
+                lines = [l.strip() for l in fh.read().splitlines()]
+        except (OSError, ValueError) as e:
+            return None, "no pin in code and %s cannot be read (%s)" % (PIN_FILE, type(e).__name__)
+        lines = [l for l in lines if l and not l.startswith("#")]
+        if not lines:
+            return None, "%s names no folder" % PIN_FILE
+        src = lines[0]
+    if not isinstance(src, str) or not os.path.isabs(src):
+        return None, "the pin in %s is not an absolute path" % where
+    if not os.path.isfile(os.path.join(src, "covenant_unified_v8.py")):
+        return None, "the pinned folder (from %s) does not hold covenant_unified_v8.py" % where
+    return os.path.abspath(src), ""
+
+
+def home_reasons(cfg, hypothetical=False):
+    """Why an ARMED config's witness folder is refused; [] when it is not, and
+    always [] for a disarmed config (rehearsal) -- unless `hypothetical`, which
+    asks what would refuse it if it were armed, for the rehearsal notice."""
+    if not isinstance(cfg, dict) or not (cfg.get("armed") or hypothetical):
+        return []
+    pin, why = pinned_home()
+    if not pin:
+        return ["armed with no pinned witness folder (%s) -- refused. Write covenant's "
+                "absolute path as the one line of %s, a file this trader never writes; "
+                "an environment variable or trader_config.json cannot stand in for it "
+                "while armed" % (why, PIN_FILE)]
+    out = []
+    for label, val in (("env SENTINEL_COVENANT_HOME", os.environ.get("SENTINEL_COVENANT_HOME")),
+                       ("trader_config.json covenant_home", cfg.get("covenant_home"))):
+        if val and not _same_path(val, pin):
+            out.append("armed with a witness folder override (%s) that is not the pinned "
+                       "folder -- refused; no seal, approval, floor or halt is taken from "
+                       "it and no Python is run from it" % label)
+    return out
+
+
+def effective_home(cfg=None):
+    """The folder whose Python may be run for this config. Armed: the pinned
+    folder, or None when home_reasons(cfg) refuses. Disarmed: covenant_home(cfg),
+    as before."""
+    if isinstance(cfg, dict) and cfg.get("armed"):
+        if home_reasons(cfg):
+            return None
+        return pinned_home()[0]
+    return covenant_home(cfg)
+
+
 def reserve_path(cfg=None):
     """Covenant's private/RESERVE.json.
 
@@ -96,7 +189,10 @@ def reserve_path(cfg=None):
 def halt_path(cfg=None):
     """Covenant's TRADER_HALT. A halt dropped in either folder stops this
     trader; one folder's halt never needs to be remembered in the other."""
-    home = covenant_home(cfg)
+    # H11: armed, the folder is the pinned one (H6) even when the config names
+    # none; a folder the config or the environment names is still looked in,
+    # because one more place a halt is honoured costs nothing.
+    home = effective_home(cfg) or covenant_home(cfg)
     return os.path.join(home, "TRADER_HALT") if home else None
 
 
@@ -180,6 +276,28 @@ print(json.dumps(D.gate_reasons(now=req.get("now"))))
 """
 
 
+# H8 (2026-11-12): WHAT WAS APPROVED, not only whether something was.
+# _GATE_SCRIPT above answers yes or no for the day. This asks covenant for the
+# record behind that answer -- the day, the plan's hash, every decision row for
+# the day and the plan's proposed orders -- so that guards.approval_reasons can
+# hold each order to it. The function it calls, covenant_daily_plan.
+# approval_record(now), is COVENANT'S to provide; where covenant does not have
+# it the answer is ok=false with that reason, and no order can be bound to an
+# approval, so none goes live. The contract is in approval_record() below.
+_APPROVAL_SCRIPT = r"""
+import json, sys
+sys.path.insert(0, ".")
+req = json.loads(sys.stdin.read())
+import covenant_daily_plan as D
+fn = getattr(D, "approval_record", None)
+if fn is None:
+    print(json.dumps({"ok": False, "why": "covenant_daily_plan has no approval_record(now): "
+                      "covenant says WHETHER today is approved but not WHAT was approved"}))
+else:
+    print(json.dumps(fn(now=req.get("now"))))
+"""
+
+
 def _child_env():
     """This process's environment without the variables that tell a Python
     interpreter WHAT CODE TO LOAD (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME,
@@ -217,9 +335,64 @@ def _refused(detail):
             "detail": detail, "mined": ""}
 
 
+# ---- R1 (2026-11-12): WHAT THIS PROCESS HAS SEEN COVENANT SEAL ---------------
+# covenant_trader.execute() took `sealed_ok` from its caller: a bare True, and
+# the order was "sealed". The live gate (guards.live_gate) no longer accepts
+# that word from anyone. seal_decision_result() below remembers, here, each
+# record covenant ADMITTED -- and only when the answer came through the real
+# runner (_run): an answer obtained through an injected `runner` is a test's
+# stand-in and is never remembered. seal_reasons() is then the one reading:
+# is THIS order in a record covenant admitted within SEAL_VALID_S? A process
+# that has not sealed through covenant has an empty memory and places nothing.
+SEAL_VALID_S = 900.0
+_SEALED = []                 # [(when, [(SYM, side, usd, qty), ...])]
+_clock = time.time           # a test replaces this to move the clock
+
+
+def _order_key(o):
+    try:
+        return (str(o["sym"]).strip().upper(), str(o["side"]), float(o["usd"]), float(o["qty"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _remember_seal(record, out):
+    if not (isinstance(out, dict) and out.get("ok") is True
+            and str(out.get("admission") or "").startswith("admitted")):
+        return
+    rows = record.get("orders") if isinstance(record, dict) else None
+    keys = [k for k in (_order_key(o) for o in (rows if isinstance(rows, list) else [])) if k]
+    _SEALED.append((_clock(), keys))
+    del _SEALED[:-50]
+
+
+def seal_reasons(order):
+    """Why this order is not covered by a seal covenant admitted, as a list;
+    [] when it is. Takes nothing from its caller but the order."""
+    want = _order_key(order)
+    if want is None:
+        return ["seal: the order has no symbol, side, dollars and quantity to look for in a sealed record"]
+    now = _clock()
+    for when, keys in reversed(_SEALED):
+        if now - when > SEAL_VALID_S or when > now + 60:
+            continue
+        for sym, side, usd, qty in keys:
+            if (sym == want[0] and side == want[1]
+                    and abs(usd - want[2]) <= 1e-6 * max(1.0, abs(usd))
+                    and abs(qty - want[3]) <= 1e-6 * max(1.0, abs(qty))):
+                return []
+    return ["seal: this process holds no record, admitted by covenant in the last %d minutes, "
+            "that contains this order -- a caller's word that it was sealed is not taken"
+            % (SEAL_VALID_S // 60)]
+
+
 def seal_decision_result(cfg, record, runner=None):
     """Covenant's seal_decision_result, run in covenant. Same dict shape."""
-    home = covenant_home(cfg)
+    # H6: armed, only the pinned folder's Python is run.
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return _refused("witness: " + "; ".join(pin_why))
+    home = effective_home(cfg)
     if not home:
         return _refused("witness: covenant_home is not configured (env "
                         "SENTINEL_COVENANT_HOME or trader_config.json), so "
@@ -236,6 +409,14 @@ def seal_decision_result(cfg, record, runner=None):
     if not isinstance(out["ok"], bool):
         return _refused("witness: covenant's seal answer had an 'ok' that is "
                         "not true or false (%s)" % type(out["ok"]).__name__)
+    if runner is None:
+        # G1 (review round 1): a disarmed rehearsal runs whatever folder the
+        # config or the environment names. A seal from such a folder must
+        # never be remembered, or a later armed gate in the same process
+        # would trust a seal the pinned witness never gave.
+        _pin, _pin_why = pinned_home()
+        if _pin and _same_path(home, _pin):
+            _remember_seal(record, out)      # R1: only an answer from the real runner
     return out
 
 
@@ -258,7 +439,11 @@ def terms_reasons(cfg):
 def daily_plan_gate_reasons(now=None, cfg=None, runner=None):
     """Covenant's covenant_daily_plan.gate_reasons(). [] means today's plan is
     approved; anything else is a reason no order may go live."""
-    home = covenant_home(cfg)
+    # H6: armed, only the pinned folder's Python is run.
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return ["daily plan gate unavailable (%s) -- nothing may go live" % "; ".join(pin_why)]
+    home = effective_home(cfg)
     if not home:
         return ["daily plan gate unavailable (covenant_home not configured) "
                 "-- nothing may go live"]
@@ -275,8 +460,47 @@ def daily_plan_gate_reasons(now=None, cfg=None, runner=None):
     return out
 
 
+def approval_record(now=None, cfg=None, runner=None):
+    """Covenant's record of today's approval, as a dict. ok=false on any
+    failure to get one, with `why`. H8.
+
+    THE CONTRACT covenant_daily_plan.approval_record(now) must meet (now is
+    epoch seconds or null, read with time.localtime as gate_reasons reads it):
+
+        {"ok": true,
+         "date": "YYYY-MM-DD",              the local day the record is for
+         "plan_hash": "<hash of that day's plan>",
+         "decisions": [                     EVERY decision row for that day,
+           {"decision": "approve" | "decline",      oldest first
+            "at": <epoch seconds>,
+            "plan_hash": "<the hash the row was signed over>"}, ...],
+         "orders": [                        the plan's PROPOSED orders
+           {"sym": "XLM", "side": "sell" | "buy", "usd": 25.0}, ...]}
+
+    Covenant reports; it does not decide here. Whether a decline is final, how
+    long an approval lasts and how close an order must be to a proposed one
+    are guards.approval_reasons' to say, in this repository, where they are
+    tested. Armed, the folder asked is the pinned one or nothing (H6)."""
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return {"ok": False, "why": "; ".join(pin_why)}
+    home = effective_home(cfg)
+    if not home:
+        return {"ok": False, "why": "covenant_home not configured"}
+    if now is not None and (isinstance(now, bool) or not isinstance(now, (int, float))):
+        return {"ok": False, "why": "now must be epoch seconds, got %s" % type(now).__name__}
+    ok, out, why = (runner or _run)(home, _APPROVAL_SCRIPT, {"now": now}, GATE_TIMEOUT_S)
+    if not ok:
+        return {"ok": False, "why": why}
+    if not isinstance(out, dict) or not isinstance(out.get("ok"), bool):
+        return {"ok": False, "why": "covenant's answer was not an approval record"}
+    return out
+
+
 if __name__ == "__main__":
     home = covenant_home()
     print("covenant_home :", home or "NOT CONFIGURED")
+    _pin, _why = pinned_home()
+    print("pinned (armed):", _pin or "NONE -- %s. An armed cycle will refuse." % _why)
     print("reserve file  :", reserve_path(), "(present)" if os.path.isfile(reserve_path()) else "(MISSING)")
     print("daily plan    :", daily_plan_gate_reasons() or "approved for today")

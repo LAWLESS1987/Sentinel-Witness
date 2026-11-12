@@ -44,11 +44,28 @@ def check(label, ok, detail=""):
 # A configuration with every gate satisfied, so that each test can break exactly
 # one thing. daily_plan_required is off here because the plan gate is DP1's
 # subject and is driven separately below.
+# H5 (2026-11-12): THE FIXTURE'S NUMBERS WERE $1,000 an order, 5 orders and
+# $5,000 a day, with a $100 test order. guards.HARD_CEILINGS now refuses any
+# cap above $25 / $50 / 2, so that fixture was no longer "clear": every check
+# below carried the ceiling's reason as well as its own. The numbers are
+# rescaled to sit inside the ceilings ($25, 2 orders, $50; a $20 order) and
+# nothing else about any check is changed.
+# H7 (2026-11-12): AN ARMING NOW CARRIES AN EXPIRY. guards.arming() reads
+# `armed: true` as armed only with an `armed_until` that is an ISO time with
+# its zone, in the future and at most 24 hours ahead; without one the config
+# is DISARMED and every fixture below that arms would be refused for that
+# alone. So the fixtures arm for one hour from now. Nothing else about any
+# check is changed; the expiry itself is driven in test_h07_arming.py.
+import time as _time_h7
+_ARMED_UNTIL = _time_h7.strftime("%Y-%m-%dT%H:%M:%SZ", _time_h7.gmtime(_time_h7.time() + 3600))
+
+
 def clear_cfg(**over):
-    cfg = {"armed": True, "daily_plan_required": False, "seal_required": True,
+    cfg = {"armed": True, "armed_until": _ARMED_UNTIL,
+           "daily_plan_required": False, "seal_required": True,
            "min_sealed_signals": 0, "rule5_require_significance": False,
-           "min_order_usd": 10.0, "max_order_usd": 1000.0,
-           "max_orders_per_day": 5, "max_daily_notional_usd": 5000.0}
+           "min_order_usd": 10.0, "max_order_usd": 25.0,
+           "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}
     cfg.update(over)
     return cfg
 
@@ -60,7 +77,7 @@ def clear_st(**over):
     return st
 
 
-ORDER = {"side": "buy", "usd": 100.0, "sym": "XRP-USD"}
+ORDER = {"side": "buy", "usd": 20.0, "sym": "XRP-USD"}
 
 
 def reasons(order=None, **kw):
@@ -168,6 +185,17 @@ def main():
     import types as _types
     import witness as _W
     _home = _W.covenant_home()
+    # H6 (2026-11-12): an ARMED config is held to a PINNED witness folder, and
+    # the fixture below is armed. On a machine that has covenant (so that
+    # G4.4b runs at all) the gate would otherwise answer "unavailable (armed
+    # with no pinned witness folder)" -- a daily-plan refusal, but not the one
+    # G4.4b is about, which is whether the gate READS the operator's decision.
+    # So the folder this suite found is pinned in code for the length of the
+    # run, as test_sw3_witness_terms.py does. NOT EXERCISED where this change
+    # was made: that machine's harness has no covenant, so G4.4b said NOT RUN
+    # before and after it.
+    if _home:
+        _W.PINNED_COVENANT_HOME = _home
     _dp = _types.SimpleNamespace(APPROVALS=os.path.join(
         _home or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NO_COVENANT_HOME"),
         "ops", "daily_approvals.jsonl"))
@@ -235,8 +263,8 @@ def main():
 
     # 6. over the room left today
     drives("G4.6 an order over the placeable room refuses, a smaller one clears",
-           {"order": {"side": "buy", "usd": 900.0, "sym": "XRP-USD"},
-            "cfg": clear_cfg(max_order_usd=200.0)}, "placeable now")
+           {"order": {"side": "buy", "usd": 24.0, "sym": "XRP-USD"},
+            "cfg": clear_cfg(max_order_usd=12.0)}, "placeable now")
 
     # 7. the per-day cap.
     #
@@ -246,7 +274,7 @@ def main():
     # at all, so five orders became none and the cap correctly said nothing.
     # The fixture now carries today's date, which is what a real state has.
     today = _t.strftime("%Y-%m-%d", _t.localtime())
-    full = clear_st(day=today, orders_today=[{"usd": 10.0, "sym": "XRP-USD"}] * 5)
+    full = clear_st(day=today, orders_today=[{"usd": 10.0, "sym": "XRP-USD"}] * 2)
     empty = clear_st(day=today, orders_today=[])
     on = reasons(st=full)
     off = reasons(st=empty)

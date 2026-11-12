@@ -77,6 +77,7 @@ sys.path.insert(0, HERE)
 import daily                      # prices, 200d regime, cross-venue verification
 import signal_ledger              # Rule 5: seals regime calls, scores them on flips
 import venues as V
+import key_scope                  # H9: what a venue's key may do; judged, never fetched, there
 import witness                    # covenant: the seal, the day's approval, the floors
 
 try:
@@ -93,11 +94,16 @@ HALT = os.path.join(HERE, "TRADER_HALT")
 STATE = os.environ.get("COVENANT_TRADER_STATE") or os.path.join(
     os.path.expanduser("~"), ".covenant", "trader_state.json")
 
+# H5 (2026-11-12): the three caps were 100.0 / 300.0 / 4 here. They are now the
+# numbers the README and MY_STRATEGY.md state ($25 an order, $50 a day, 2 a
+# day), which are also guards.HARD_CEILINGS -- so a config that leaves a cap
+# out falls back to the documented number, not to four times it. This dict
+# must equal guards.SHIPPED_DEFAULTS (test_h05_config.py).
 DEFAULT_CONFIG = {
     "armed": False,
-    "max_order_usd": 100.0,
-    "max_daily_notional_usd": 300.0,
-    "max_orders_per_day": 4,
+    "max_order_usd": 25.0,
+    "max_daily_notional_usd": 50.0,
+    "max_orders_per_day": 2,
     "min_order_usd": 5.0,
     "max_position_pct": 0.20,
     "min_cash_pct": 0.10,
@@ -124,8 +130,26 @@ DEFAULT_CONFIG = {
 
 
 # ------------------------------------------------------------------- plumbing
+def _absent(path):
+    """True only when the OS says `path` is not there (FileNotFoundError).
+    H11 (2026-11-12): os.path.exists answers False for a path it could not
+    examine, and in three places here False was the answer that carried on --
+    "no config yet, write the default one", "no state yet, start from zero",
+    "no floors yet, set them at today's quantities". guards.path_state is the
+    one reading; without guards the same test is made here."""
+    if _guards is not None:
+        return _guards.path_state(path) == "absent"
+    try:
+        os.lstat(path)
+        return False
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def load_config():
-    if not os.path.exists(CONFIG):
+    if _absent(CONFIG):          # H11: was `not os.path.exists(CONFIG)`
         json.dump(DEFAULT_CONFIG, open(CONFIG, "w", encoding="utf-8"), indent=2)
         print(f"wrote a disarmed default config to {os.path.basename(CONFIG)}")
     cfg = dict(DEFAULT_CONFIG)
@@ -133,13 +157,104 @@ def load_config():
     return cfg
 
 
-def load_state():
+class StateUnreadable(Exception):
+    """The state file exists and cannot be read, parsed or made sense of. H2.
+
+    UNKNOWN IS NOT ABSENT -- the doctrine ReserveUnreadable below already
+    states for the floor file, and guards.load_trader_state for this one. This
+    file's own reader did not follow it: it caught every exception and answered
+    with the defaults, so a state that could not be read came back as "no
+    orders today, nothing ever bought, no equity peak", and the save at the end
+    of the cycle wrote that over the real record."""
+
+
+def _fresh_state():
+    return {"orders_today": [], "day": "", "equity_peak": 0.0,
+            "equity_start_of_day": 0.0, "closed_trades": [], "last_sold": {},
+            "sealed_signals": 0, "bought_total_usd": 0.0}
+
+
+def _reject_constant(name):
+    raise ValueError("the state holds %s, which is not a number" % name)
+
+
+_STATE_SHAPE = (("orders_today", list), ("closed_trades", list), ("fiat_buys", list),
+                ("last_sold", dict), ("rule5", dict), ("day", str))
+_STATE_NUMBERS = ("equity_peak", "equity_start_of_day", "bought_total_usd", "sealed_signals")
+
+
+def _state_problem(st):
+    """Why this parsed state cannot be used, or None. Containers must be the
+    containers the guards read and the running totals finite numbers at or
+    above zero; a row inside a list is the guards' to judge (H1), not this."""
+    if not isinstance(st, dict):
+        return "it holds a %s, not an object" % type(st).__name__
+    for key, kind in _STATE_SHAPE:
+        if key in st and not isinstance(st[key], kind):
+            return "%r is a %s, not a %s" % (key, type(st[key]).__name__, kind.__name__)
+    # H4: the day marks. "" is "no day yet"; anything else must be a date.
+    for key in ("day", "last_seen_day"):
+        v = st.get(key)
+        if v not in (None, "") and not (_guards.is_day(v) if _guards else False):
+            return "%r is %r, not a date written YYYY-MM-DD" % (key, v)
+    for key in _STATE_NUMBERS + ("last_seen_at",):
+        if key in st:
+            v = st[key]
+            if (isinstance(v, bool) or not isinstance(v, (int, float)) or v != v
+                    or v in (float("inf"), float("-inf")) or v < 0):
+                return "%r is %r, not a finite number at or above zero" % (key, v)
+    return None
+
+
+def _read_state_file(path):
+    """The state at `path`, or None when there is no file. Raises
+    StateUnreadable for a file that is there and cannot be used."""
+    if _absent(path):            # H11: was `not os.path.lexists(path)`
+        return None
     try:
-        return json.load(open(STATE, encoding="utf-8"))
-    except Exception:
-        return {"orders_today": [], "day": "", "equity_peak": 0.0,
-                "equity_start_of_day": 0.0, "closed_trades": [], "last_sold": {},
-                "sealed_signals": 0, "bought_total_usd": 0.0}
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        st = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (OSError, ValueError) as e:
+        raise StateUnreadable("%s: %s" % (type(e).__name__, str(e)[:120])) from e
+    why = _state_problem(st)
+    if why:
+        raise StateUnreadable(why)
+    return st
+
+
+def load_state():
+    """The trader's state. A MISSING file is a known empty state (the trader
+    has never run). A file that EXISTS and cannot be read, parsed or made sense
+    of raises StateUnreadable -- H2 (2026-11-12). run_once refuses the cycle on
+    it, and save_state refuses to write over it."""
+    st = _read_state_file(STATE)
+    return _fresh_state() if st is None else st
+
+
+def set_state_aside(path=None):
+    """Keep a byte-for-byte COPY of an unreadable state beside it, and leave
+    the original exactly where and as it is. Returns the copy's path, or None.
+
+    The original is NOT moved. Moving it would leave no file, and no file reads
+    as "the trader has never run" -- the zeroed day count, lifetime buy total
+    and equity peak this change exists to stop. So the unreadable file stays in
+    place and every later cycle refuses on it until an operator repairs or
+    removes it; the copy is there so that repair cannot lose the evidence.
+    Named by the content's SHA-256, so the same bytes are copied once."""
+    p = path or STATE
+    try:
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        aside = "%s.unreadable-%s" % (p, hashlib.sha256(raw).hexdigest()[:16])
+        if not os.path.exists(aside):
+            with open(aside, "xb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+        return aside
+    except OSError:
+        return None
 
 
 def save_state(st):
@@ -156,19 +271,50 @@ def save_state(st):
     than relying on the last check in the chain.
     """
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    # H2 (2026-11-12): NEVER WRITE OVER A RECORD THAT COULD NOT BE READ. The
+    # file on disk is read again here, at the last moment, whatever the caller
+    # believes about it: if it is there and unreadable this raises, and the
+    # unreadable bytes stay as they are.
+    _read_state_file(STATE)
     import durable
     durable.write_json(STATE, st, indent=2)
 
 
-def roll_day(st):
-    today = time.strftime("%Y-%m-%d")
+class ClockWentBack(Exception):
+    """The date or time reads earlier than this trader has already seen. H4."""
+
+
+def roll_day(st, now=None):
+    # H4 (2026-11-12): THE DAY ROLLS FORWARD ONLY. This compared the stored
+    # day with today's and rolled when they DIFFERED, so a clock set back a
+    # day (or a time zone crossed westward near midnight) cleared the day's
+    # orders and made an old approval current again. guards.clock_back reads
+    # the latest day and moment on record; earlier than either raises, and
+    # run_once refuses the cycle. The two marks are only ever raised.
+    now_t = time.time() if now is None else now
+    today = time.strftime("%Y-%m-%d", time.localtime(now_t))
+    if _guards is not None:
+        why = _guards.clock_back(st, now_t)
+        if why:
+            raise ClockWentBack(why)
+    st["last_seen_day"] = today
+    prev_at = st.get("last_seen_at")
+    st["last_seen_at"] = max(float(prev_at), float(now_t)) if isinstance(prev_at, (int, float)) and not isinstance(prev_at, bool) else float(now_t)
     if st.get("day") != today:
         st["day"] = today
         st["orders_today"] = []
         st["equity_start_of_day"] = 0.0     # set once equity is known this run
     # The trailing-week record of fiat-funded buys (R6 / guards.WeeklyBudget).
-    cutoff = time.time() - 7 * 86400
-    st["fiat_buys"] = [r for r in st.get("fiat_buys", []) if float(r.get("at", 0)) >= cutoff]
+    cutoff = now_t - 7 * 86400
+    # H1 (2026-11-12): ONLY A ROW THAT CAN BE READ AND IS OLD IS DROPPED. This
+    # was `float(r.get("at", 0)) >= cutoff`, and NaN is not >= anything, so a
+    # row whose time was NaN fell out of the week and its dollars with it. A
+    # row that cannot be read stays; guards.WeeklyBudget then says the week is
+    # unknown and blocks, which is what a bad row must do.
+    def _old(r):
+        at = _guards.finite_nonnegative(r.get("at")) if (_guards and isinstance(r, dict)) else None
+        return at is not None and at < cutoff
+    st["fiat_buys"] = [r for r in st.get("fiat_buys", []) if not _old(r)]
     # BACKFILL THE LIFETIME BUY TOTAL, BUT ONLY ON EVIDENCE.
     #
     # guards.BuyBudget measures cumulative buying against half the starting
@@ -298,6 +444,22 @@ def admitted(seal_result):
 def gather(cfg):
     """Balances per venue + live prices and 200d regime. Returns a portfolio."""
     per_venue, venue_notes = {}, []
+    # H3 (2026-11-12): a venue that HAS a credential and could not be read is
+    # named here. Its holdings are missing from the book exactly as an unpriced
+    # holding's value is, and plan() refuses on either. A venue with no
+    # credential is not one of these: this machine holds nothing it can see there.
+    venues_failed = []
+    # H10 (2026-11-12): WHAT IS ALREADY OPEN, AND WHAT HAS FILLED. A placed
+    # order was recorded and never looked at again: a limit order still
+    # resting on the book was invisible, so the next cycle planned the same
+    # sale on top of it, and its dollars counted as raised whether or not it
+    # ever filled. Each venue that can be read is now also asked for its open
+    # orders and for the day's fills, through the adapter's own
+    # open_orders_norm() and recent_fills() (a test hands in a fake venue).
+    # A venue whose open orders cannot be read is named, and plan() plans
+    # nothing; fills that cannot be read simply confirm nothing.
+    open_orders, open_unread, fills, fills_unread = [], [], {}, []
+    day_start = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
     for v in V.all_venues():
         if not v.has_credentials():
             venue_notes.append(f"{v.name}: no credential installed")
@@ -306,6 +468,40 @@ def gather(cfg):
             per_venue[v.name] = v.balances()
         except V.VenueError as e:
             venue_notes.append(f"{v.name}: {e}")
+            venues_failed.append(v.name)
+            continue
+        try:
+            rows = v.open_orders_norm()
+            if not isinstance(rows, list) or any(
+                    not isinstance(r, dict) or not isinstance(r.get("sym"), str) or not r["sym"].strip()
+                    for r in rows):
+                raise V.VenueError("the answer was not a list of orders naming a symbol")
+            open_orders += [dict(r, venue=v.name) for r in rows]
+        except Exception as e:                                   # noqa: BLE001
+            open_unread.append(v.name)
+            venue_notes.append(f"{v.name}: open orders could not be read ({type(e).__name__}: {str(e)[:100]})")
+        try:
+            got = v.recent_fills(day_start)
+            if not isinstance(got, list):
+                raise V.VenueError("the answer was not a list of fills")
+            fills[v.name] = got
+        except Exception as e:                                   # noqa: BLE001
+            fills_unread.append(v.name)
+            venue_notes.append(f"{v.name}: fills could not be read, so no sale there is confirmed "
+                               f"({type(e).__name__}: {str(e)[:100]})")
+
+    # H1 (2026-11-12): A BALANCE THAT IS NOT A FINITE NUMBER AT OR ABOVE ZERO
+    # is a venue that could not be read, not a holding of NaN units.
+    for vname in sorted(per_venue):
+        odd = [s for s, a in per_venue[vname].items()
+               if isinstance(a, bool) or not isinstance(a, (int, float))
+               or a != a or a in (float("inf"), float("-inf")) or a < 0]
+        if odd:
+            venue_notes.append("%s: balance for %s is not a finite number at or above "
+                               "zero -- this venue is treated as unread"
+                               % (vname, ", ".join(sorted(odd))))
+            del per_venue[vname]
+            venues_failed.append(vname)
 
     merged = {}
     for vname, bal in per_venue.items():
@@ -317,27 +513,152 @@ def gather(cfg):
     cash = sum(a for s, per in merged.items()
                if s in ("USD", "USDC", "USDT") for a in per.values())
     syms = [s for s in merged if s not in ("USD", "USDC", "USDT")]
-    if cfg.get("symbols"):
-        syms = [s for s in syms if s in cfg["symbols"]]
+    # R3 (2026-11-12): `symbols` SAYS WHAT MAY BE TRADED. IT DOES NOT SAY WHAT
+    # IS HELD. This used to drop every holding not in the list before pricing,
+    # so it was missing from `total` exactly as an unpriced holding was (H3):
+    # with XLM in the list and a larger ETH holding outside it, XLM at 15% of
+    # the book read as 57%, the concentration cap asked for a trim, and a sale
+    # was planned. Every holding is now priced. One outside the list goes to
+    # `outside` -- counted in `total`, shown, in the guards' book, and never
+    # given an order (plan() walks `positions` only). One outside the list
+    # that cannot be priced is unpriced like any other, and plan() plans
+    # nothing: it is either counted or the cycle stops.
+    wanted = set(cfg.get("symbols") or [])
 
     prices = daily.prefetch(syms, "both") if syms else {}
-    positions, unpriced = [], []
+    positions, unpriced, outside = [], [], []
     for s in sorted(syms):
         px, closes, why, _n, _d = prices.get(s, (None, None, "not fetched", [], []))
         qty = sum(merged[s].values())
         if px is None:
             unpriced.append({"sym": s, "qty": qty, "why": why or "no price"})
             continue
+        # H1: a price of NaN, infinity, zero or less is no price. NaN here made
+        # the position's value, the total and every share of it NaN.
+        if (isinstance(px, bool) or not isinstance(px, (int, float))
+                or px != px or px in (float("inf"), float("-inf")) or px <= 0):
+            unpriced.append({"sym": s, "qty": qty,
+                             "why": "price %r is not a finite number above zero" % (px,)})
+            continue
         s200 = statistics.fmean(closes) if closes and len(closes) >= 50 else None
-        positions.append({"sym": s, "qty": qty, "px": px, "val": qty * px,
-                          "s200": s200, "bars": len(closes) if closes else 0,
-                          "regime": ("UP" if s200 and px >= s200 else
-                                     "DOWN" if s200 else "n/a"),
-                          "at": dict(merged[s])})
-    total = sum(p["val"] for p in positions) + cash
-    return {"positions": positions, "cash": cash, "total": total,
+        (outside if wanted and s not in wanted else positions).append(
+            {"sym": s, "qty": qty, "px": px, "val": qty * px,
+             "s200": s200, "bars": len(closes) if closes else 0,
+             "regime": ("UP" if s200 and px >= s200 else
+                        "DOWN" if s200 else "n/a"),
+             "at": dict(merged[s])})
+    total = sum(p["val"] for p in positions) + sum(p["val"] for p in outside) + cash
+    return {"positions": positions, "cash": cash, "total": total, "outside": outside,
             "unpriced": unpriced, "venue_notes": venue_notes,
-            "venues_read": sorted(per_venue)}
+            "venues_read": sorted(per_venue), "venues_failed": sorted(venues_failed),
+            "open_orders": open_orders, "open_orders_unread": sorted(open_unread),
+            "fills": fills, "fills_unread": sorted(fills_unread)}
+
+
+FILL_COMPLETE = 0.98      # a fill of at least this share of the order is the order, filled
+
+
+def apply_fills(st, pf):
+    """Mark today's rows with what the venues confirm was filled. H10.
+
+    Only rows the trader wrote with a `fill` key are touched (a row from before
+    fills were tracked keeps its old meaning in guards._proceeds). A row is
+    matched to fills by the venue it went to and the order id the venue gave;
+    a row whose answer was lost has no id and stays unconfirmed. Returns the
+    lines to print."""
+    by_id = {}
+    for venue, rows in (pf.get("fills") or {}).items():
+        for f in rows if isinstance(rows, list) else []:
+            if not isinstance(f, dict):
+                continue
+            usd = f.get("usd")
+            if isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd != usd or usd < 0 \
+                    or usd == float("inf"):
+                continue
+            # G11 (review round 1): a fill with no order id used to be filed under the
+            # text "None" and could then match a row whose id was lost. It matches nothing.
+            if not f.get("order_id"):
+                continue
+            key = (venue, str(f.get("order_id")))
+            by_id[key] = by_id.get(key, 0.0) + float(usd)
+    notes = []
+    for row in st.get("orders_today", []) or []:
+        if not isinstance(row, dict) or row.get("fill") is None or not row.get("txid"):
+            continue
+        got = sum(by_id.get((row.get("venue"), i.strip()), 0.0) for i in str(row["txid"]).split(","))
+        if got <= 0:
+            continue
+        want = row.get("usd")
+        # G5 (review round 1): the venues return one page of fills. A later cycle can
+        # see fewer of this order's fills than an earlier one did; what was confirmed
+        # is never taken back within the day.
+        prior = row.get("filled_usd")
+        if isinstance(prior, (int, float)) and not isinstance(prior, bool) and prior == prior                 and prior != float("inf") and prior > got:
+            got = float(prior)
+        row["filled_usd"] = got
+        row["fill"] = ("CONFIRMED" if isinstance(want, (int, float)) and not isinstance(want, bool)
+                       and got >= FILL_COMPLETE * want else "PARTIAL")
+        notes.append("%s %s $%.2f at %s: %s, $%.2f filled"
+                     % (row.get("side"), row.get("sym"), want or 0.0, row.get("venue"), row["fill"], got))
+    return notes
+
+
+def unresolved_symbols(st):
+    """{SYM: why} for every symbol with an order in today's record whose outcome
+    is not known. G7 (review round 1, 2026-11-12).
+
+    execute() writes a row as PENDING before it calls the venue and removes it
+    only on a definite refusal. After a timeout the row stays, with no order id:
+    the venue may have booked it. plan() could not see that row (it sees only the
+    orders open AT the venue, and a filled or cancelled one is not open), so the
+    next cycle planned the same order again under a new client reference, which
+    no venue can recognise as a repeat. A symbol with such a row is planned
+    nothing until a person resolves the row."""
+    out = {}
+    rows = st.get("orders_today") if isinstance(st, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") == "PENDING" or (row.get("fill") is not None and not row.get("txid")):
+            out[str(row.get("sym") or "").upper()] = (
+                "an order for it was sent%s and the answer was lost -- it may be booked"
+                % ((" to " + str(row.get("venue"))) if row.get("venue") else ""))
+    return out
+
+
+def drop_unresolved(orders, st):
+    """(orders with every unresolved symbol removed, the notes saying which)."""
+    held = unresolved_symbols(st)
+    kept, notes = [], []
+    for o in orders:
+        why = held.get(str(o.get("sym") or "").upper())
+        if why is None:
+            kept.append(o)
+        else:
+            notes.append("unresolved order: nothing is planned for %s this cycle (%s); look at the "
+                         "venue, then correct or remove that row in the state file" % (o.get("sym"), why))
+    return kept, notes
+
+
+def book_incomplete(pf):
+    """Why this portfolio is not the whole book, as a list of phrases; [] when
+    it is. H3 (2026-11-12). Two ways a holding goes missing from `total`:
+    it could not be priced (the venues disagree, a fetch failed, the price was
+    not a number), or the venue holding it could not be read at all. Either
+    way every share of the book computed from `total` is too large."""
+    out = []
+    for u in pf.get("unpriced") or []:
+        if isinstance(u, dict):
+            out.append("%s has no price (%s)" % (u.get("sym"), u.get("why") or "no reason given"))
+        else:
+            out.append("%s has no price" % (u,))
+    for name in pf.get("venues_failed") or []:
+        out.append("venue %s could not be read" % name)
+    # H10: what is already open there is part of the book. Unknown, a sale
+    # could be planned on top of one that is still resting.
+    for name in pf.get("open_orders_unread") or []:
+        out.append("the open orders at %s could not be read" % name)
+    return out
 
 
 # --------------------------------------------------------------- rule engine
@@ -403,7 +724,7 @@ def reserve_baseline(pf, path=RESERVE_PATH):
     # means "no floors have been set yet"; a file that exists and will not
     # parse means the floors are UNKNOWN, and the one thing that must not
     # happen is to carry on from an empty baseline. See ReserveUnreadable.
-    if os.path.exists(path):
+    if not _absent(path):        # H11: was `os.path.exists(path)`
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -499,16 +820,50 @@ def plan(cfg, pf, week_spent=0.0):
     nothing. A buy path would be inventing an edge the data does not support.
     """
     orders, notes = [], []
+    # H3 (2026-11-12): AN INCOMPLETE BOOK PLANS NOTHING. gather() leaves a
+    # holding it could not price out of `total`, so every other holding's share
+    # of the book reads too high; a coin at 15% looked like 60%, the
+    # concentration cap wanted it trimmed, and a sale was planned because a
+    # price feed was down. The floors are not read and nothing is written
+    # either: this returns before reserve_baseline().
+    missing = book_incomplete(pf)
+    if missing:
+        return [], ["BOOK INCOMPLETE -- planning NO orders this cycle: %s. Every share "
+                    "of the portfolio would be computed against a total that leaves "
+                    "these out. The plan resumes on the first cycle that can read and "
+                    "price everything." % "; ".join(missing)]
     total, cap = pf["total"], cfg["max_position_pct"]
     if total <= 0:
         return orders, ["portfolio total is zero -- nothing to plan"]
+
+    # H6 (2026-11-12): ARMED, THE RESERVE ON AN OPEN COIN MAY NOT BE UNDER THE
+    # SHIPPED 50%. The trading_scope record can set it to anything down to 0;
+    # disarmed that is a rehearsal and is planned as before. Armed, a reserve
+    # under the shipped floor plans nothing, here where the reserve is applied
+    # (run_once has already refused the cycle on the same reason).
+    if _guards is not None and cfg.get("armed"):
+        _s = _guards.trading_scope(cfg)
+        if _s is not None and _s["open_reserve_pct"] < _guards.SHIPPED_RESERVE_PCT:
+            return [], ["ARMED WITH A RESERVE UNDER THE SHIPPED FLOOR (trading_scope."
+                        "open_reserve_pct %g, shipped %g) -- planning NO orders. A reserve "
+                        "under the shipped floor is rehearsal-only; raise it or disarm."
+                        % (_s["open_reserve_pct"], _guards.SHIPPED_RESERVE_PCT)]
 
     # THE RESERVE. Every order this function can produce is a SELL, and the
     # guard stack is consulted for buys only ("a guard never stops a sale"),
     # so a reserve enforced there would never run. It is enforced HERE, on the
     # quantity itself, before an order exists.
     try:
-        base, held_now, raised = reserve_baseline(pf)
+        # H6b (2026-11-12): THE PATH IS READ NOW, NOT AT IMPORT. This was
+        # reserve_baseline(pf), whose default argument is the RESERVE_PATH of
+        # the moment the module was loaded -- while witness_ready() checks the
+        # RESERVE_PATH of the moment it is called. They are the same object in
+        # a real run. Found by an end-to-end rehearsal that moved one and not
+        # the other: the cycle passed witness_ready on the pinned folder's
+        # floor file and then read (and, finding none, CREATED) floors at the
+        # other path. The floor file plan() reads is now the one that was
+        # checked.
+        base, held_now, raised = reserve_baseline(pf, RESERVE_PATH)
     except ReserveUnreadable as e:
         # FAIL CLOSED, and it costs nothing to do so. Every order this
         # function can produce is a SELL, so refusing to plan is precisely the
@@ -704,7 +1059,14 @@ def plan(cfg, pf, week_spent=0.0):
     # Shipped OFF (allow_fiat_buys false, budget 0). Every buy it emits is
     # fiat-funded, so FiatBuyPermission and BuyBudget apply to it unchanged.
     weekly = float(cfg.get("weekly_fiat_budget_usd") or 0.0)
-    if cfg.get("allow_fiat_buys") and weekly > 0:
+    # R4: a permission is the boolean true. `cfg.get("allow_fiat_buys")` took
+    # anything truthy -- the text "false" bought.
+    if cfg.get("allow_fiat_buys") is True and weekly > 0 and week_spent is None:
+        # H1: unknown is not zero. A week that cannot be totalled buys nothing.
+        notes.append("R6 contribution: the week's record of dollar buys cannot be read "
+                     "(a row is missing, not finite or not above zero) -- nothing is "
+                     "contributed until it is repaired")
+    elif cfg.get("allow_fiat_buys") is True and weekly > 0:
         floor_pct = float(cfg.get("contribution_min_cash_pct", cfg.get("min_cash_pct", 0.10)))
         cash_after = pf["cash"] + sum(o["usd"] for o in _counted(orders))   # today's trims raise cash first
         spare = cash_after - floor_pct * total
@@ -749,11 +1111,29 @@ def plan(cfg, pf, week_spent=0.0):
                     notes.append(f"R6 contribution: ${share:,.2f} into each of "
                                  f"{', '.join(p['sym'] for p in eligible[:n])} (${room:,.2f} room "
                                  f"this week, floor kept)")
+    # H10 (2026-11-12): NOTHING FOR A SYMBOL THAT ALREADY HAS AN ORDER OPEN.
+    # Applied last and by removal, so an order dropped here has still used its
+    # slot and its dollars in the sums above: the plan gets smaller, never
+    # larger, for it.
+    busy = {str(o.get("sym") or "").upper(): o for o in (pf.get("open_orders") or [])
+            if isinstance(o, dict)}
+    if busy:
+        kept = []
+        for o in orders:
+            hit = busy.get(str(o["sym"]).upper())
+            if hit is None:
+                kept.append(o)
+            else:
+                notes.append("open order: %s already has a %s order open at %s -- nothing is "
+                             "planned for it this cycle" % (o["sym"], hit.get("side") or "?",
+                                                            hit.get("venue") or "a venue"))
+        orders = kept
     return orders, notes
 
 
 # ------------------------------------------------------------------ execution
-def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks):
+def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None,
+                  venue=None, key_cache=None):
     """Every reason this specific order may not go live. Empty list = clear.
 
     ONE IMPLEMENTATION SINCE 2026-09-07. The rule moved to guards.py so that
@@ -770,9 +1150,89 @@ def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks):
     if _guards is None:
         return ["guards.py unavailable -- the per-trade and per-day caps "
                 "cannot be evaluated"]
-    return _guards.preconditions(order, cfg=cfg, st=st,
-                                 sealed_ok=bool(sealed_ok),
-                                 guard_blocks=guard_blocks, caller="trader")
+    bad = _guards.preconditions(order, cfg=cfg, st=st,
+                                sealed_ok=bool(sealed_ok),
+                                guard_blocks=guard_blocks, caller="trader")
+    # H8 (2026-11-12): THE APPROVAL BINDS THE ORDER. The gate inside
+    # guards.preconditions asked whether today is approved; this asks whether
+    # THIS order is one the approved plan proposed -- and only once everything
+    # else has cleared, so a disarmed or refused order never starts covenant.
+    #
+    # `approval` is None for a caller that is not about to place anything (the
+    # shape every caller had before today). execute() passes a one-slot holder,
+    # {"record": ...}: the record is fetched from the witness the first time it
+    # is needed and reused for the rest of the cycle. It is here, in the one
+    # function that answers "may this order go live", rather than beside it in
+    # execute(): the first cut put it there, and test_f7_caps.py's bookkeeping
+    # harness -- which replaces this function to let an order through -- was
+    # refused by a check it had not replaced.
+    if (not bad and approval is not None and isinstance(cfg, dict)
+            and cfg.get("daily_plan_required", True)):
+        if approval.get("record") is None:
+            try:
+                approval["record"] = witness.approval_record(cfg=cfg)
+            except Exception as e:                                # noqa: BLE001
+                approval["record"] = {"ok": False,
+                                      "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
+        bad = list(_guards.approval_reasons(order, approval["record"],
+                                            st.get("orders_today") if isinstance(st, dict) else None))
+    # H9 (2026-11-12): WHAT THE VENUE'S KEY MAY DO. Asked last, once per venue
+    # per cycle, and only for an order that has cleared everything else: the
+    # key must be able to trade and unable to move funds out, and an answer
+    # that cannot be read refuses (key_scope.key_reasons). `venue` is None for
+    # a caller that is not about to place anything.
+    if not bad and venue is not None:
+        cache = key_cache if key_cache is not None else {}
+        name = getattr(venue, "name", "?")
+        if name not in cache:
+            cache[name] = list(key_scope.key_reasons(venue))
+        bad = list(cache[name])
+    return bad
+
+
+def _place_kwargs(venue, **kw):
+    """The keyword arguments this venue's place() accepts, out of `kw`. Every
+    adapter in venues.py takes ref_px and client_ref (test_h10 pins that); a
+    stand-in in an older test takes neither and is called as it always was."""
+    import inspect
+    try:
+        params = inspect.signature(venue.place).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kw)
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _malformed_order(o):
+    """Why this order is not one, or None. Symbol a non-empty string, side
+    exactly buy or sell, quantity and dollars each a finite number above zero."""
+    if not isinstance(o, dict):
+        return "order is not an object -- refusing"
+    if not isinstance(o.get("sym"), str) or not o["sym"].strip():
+        return "order names no symbol -- refusing"
+    if o.get("side") not in ("buy", "sell"):
+        return "order side is not exactly 'buy' or 'sell' (got %r) -- refusing" % (o.get("side"),)
+    for key, label in (("usd", "amount"), ("qty", "quantity")):
+        x = o.get(key)
+        if (isinstance(x, bool) or not isinstance(x, (int, float)) or x != x
+                or x in (float("inf"), float("-inf")) or x <= 0):
+            return ("order %s is not a finite number above zero (got %r) -- refusing"
+                    % (label, x))
+    # R2 (2026-11-12): BASE AND QUOTE MUST AGREE. `qty` is units of the coin,
+    # `usd` is dollars, and where the order carries its own price the two must
+    # say the same thing: qty x px within the final-order tolerance of usd. An
+    # order built with dollars in the quantity field (25 "units" of a $2,000
+    # coin, $25 declared) is the mistake this catches, before any venue is
+    # called.
+    px = o.get("px")
+    if isinstance(px, (int, float)) and not isinstance(px, bool) and px == px and 0 < px < float("inf"):
+        worth = float(o["qty"]) * float(px)
+        if abs(worth - float(o["usd"])) > V.FINAL_TOLERANCE * float(o["usd"]):
+            return ("order quantity and dollars disagree: %.10g units at its own price %.10g is "
+                    "$%.2f, and it declares $%.2f -- units of the coin and dollars may have "
+                    "been confused; refusing" % (o["qty"], px, worth, o["usd"]))
+    return None
 
 
 def venue_for(order, live_venues):
@@ -786,7 +1246,7 @@ def venue_for(order, live_venues):
 
 
 def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
-            may_buy=None):
+            may_buy=None, approval=None, portfolio=None):
     """`may_buy` -- optional callable sym -> [blocking guard names]. A83.
 
     THE GUARD STACK WAS ASKED WITHOUT A SYMBOL, so the asset-specific guards
@@ -804,9 +1264,28 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     enforces -- a rule about what may be sold has no view on what may be
     bought, and a guard never stops a sale.
     """
+    # R1 (2026-11-12): NOTHING THIS FUNCTION IS HANDED CAN MAKE AN ORDER LIVE.
+    # `cfg`, `st`, `sealed_ok`, `guard_blocks`, `may_buy` and `approval` are a
+    # caller's -- and a caller with a permissive dict and sealed_ok=True used
+    # to be believed. They now work in one direction only: the first pass
+    # below (preconditions on what was handed in) can REFUSE, and what it lets
+    # through is then judged by guards.live_gate from the config and state on
+    # DISK, the witness and the venue, which hands back a permit or reasons.
+    # `approval` is kept in the signature and ignored: the gate asks covenant.
+    # `portfolio` is the book as run_once measured it (a guards.State); the
+    # gate evaluates a buy's guards on it.
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
+        # H1 (2026-11-12): AN ORDER THAT IS NOT WELL-FORMED REACHES NO VENUE,
+        # not even its dry-run endpoint. guards.preconditions refuses it too
+        # (so it could never go live); this stops it being handed to place()
+        # with a NaN quantity and booked in the day's record as "unknown".
+        malformed = _malformed_order(o)
+        if malformed:
+            results.append({**o, "status": "REFUSED", "detail": malformed,
+                            "blocked_by": [malformed]})
+            continue
         extra = []
         if o.get("side") == "buy" and may_buy is not None:
             try:
@@ -814,9 +1293,11 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             except Exception as e:                            # noqa: BLE001
                 # A guard that cannot be evaluated is not a guard that passed.
                 extra = ["per-symbol guards unavailable (%s)" % type(e).__name__]
-        bad = preconditions(cfg, st, {}, o, sealed_ok,
-                            list(guard_blocks) + extra if extra else guard_blocks)
+        # H9: the venue is chosen BEFORE the question is asked, because one of
+        # the things that must say yes is that venue's key.
         v = venue_for(o, live_venues)
+        blocks = list(guard_blocks) + extra if extra else guard_blocks
+        bad = preconditions(cfg, st, {}, o, sealed_ok, blocks)
         if v is None:
             results.append({**o, "status": "NO VENUE",
                             "detail": "no credentialed venue holds it"})
@@ -824,9 +1305,48 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
         if plan_only:
             results.append({**o, "status": "PLAN ONLY", "detail": "no venue call"})
             continue
-        go_live = not bad
+        # R1: THE GATE. Only an order the first pass let through is asked
+        # about, and only the gate's permit makes it live.
+        permit = None
+        if not bad:
+            if _guards is None:
+                bad = ["guards.py unavailable -- the live gate cannot be asked"]
+            else:
+                try:
+                    bad, permit = _guards.live_gate(
+                        o, v, cfg=cfg, st=st, portfolio=portfolio,
+                        caller_blocks=list(blocks or []) if o.get("side") == "buy" else None)
+                    bad = list(bad)
+                except Exception as e:                            # noqa: BLE001
+                    bad, permit = ["live gate failed (%s: %s) -- nothing goes live"
+                                   % (type(e).__name__, str(e)[:80])], None
+        go_live = (not bad) and permit is not None
         pending = None
         fiat_part = float(o["usd"])
+        # H10 (2026-11-12): THE REFERENCE PRICE AND THE CLIENT REFERENCE.
+        # ref_px is the planner's own price for this order (cross-venue
+        # checked); where an order carries none it is the price its own
+        # dollars and quantity imply. The venue adapter turns it into a limit
+        # no worse than venues.PRICE_BAND from it. cref is the same for the
+        # same (day, symbol, side, size, sequence) -- sequence being how many
+        # orders for this symbol and side today's record already holds.
+        ref_px = o.get("px")
+        if (isinstance(ref_px, bool) or not isinstance(ref_px, (int, float)) or ref_px != ref_px
+                or ref_px <= 0 or ref_px == float("inf")):
+            ref_px = float(o["usd"]) / float(o["qty"])
+        seq = sum(1 for r_ in st.get("orders_today", []) or []
+                  if isinstance(r_, dict) and r_.get("sym") == o["sym"] and r_.get("side") == o.get("side"))
+        cref = V.client_ref(st.get("day") or time.strftime("%Y-%m-%d"), o["sym"], o["side"],
+                            "%.8f" % float(o["qty"]), seq)
+        # R2 (2026-11-12): THE SIZE THAT IS SENT. The limit sits a band away
+        # from the reference, so the declared quantity at that limit could
+        # move more than the declared dollars. The quantity is cut so that the
+        # MOST the order can move inside the band is the declared dollars:
+        # declared / (reference x (1 + band)), about 1% under the plan's own
+        # quantity, and never above it. The adapter then rounds DOWN to the
+        # venue's increment and checks the result (venues.final_order). The
+        # day's record keeps the declared dollars, which the order cannot exceed.
+        qty_send = min(float(o["qty"]), float(o["usd"]) / (ref_px * (1.0 + V.PRICE_BAND)))
         if go_live:
             # THE FIAT PORTION IS MEASURED FIRST, from the day's sale headroom
             # before this order exists in orders_today -- appending first would
@@ -853,11 +1373,17 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             # and the order was invisible to every guard (pre-push audit,
             # 2026-09-06). The row is completed below, or left saying UNKNOWN.
             pending = {"sym": o["sym"], "usd": o["usd"], "side": o.get("side"),
-                       "at": time.time(), "txid": None, "status": "PENDING"}
+                       "at": time.time(), "txid": None, "status": "PENDING",
+                       # H10: where it went, the reference it carries, and that
+                       # nothing has confirmed it filled yet.
+                       "venue": v.name, "client_ref": cref, "fill": "UNCONFIRMED",
+                       "qty": qty_send}                       # R2: the size that was sent
             st.setdefault("orders_today", []).append(pending)
             save_state(st)
         try:
-            r = v.place(o["sym"], o["side"], o["qty"], live=go_live)
+            r = v.place(o["sym"], o["side"], qty_send, live=go_live,
+                        **_place_kwargs(v, ref_px=ref_px, client_ref=cref,
+                                        permit=permit, declared_usd=float(o["usd"])))
             results.append({**o, "status": "PLACED" if go_live else "VALIDATED",
                             "detail": r.get("descr") or "", "txid": r.get("txid"),
                             "blocked_by": bad, "venue": v.name})
@@ -886,7 +1412,15 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                 save_state(st)
         except V.VenueError as e:
             msg = str(e)
-            if pending is not None and msg.startswith("HTTP 4"):
+            # H10: a definite refusal is a 4xx (but not 408, a timeout, which
+            # says nothing about what the venue did) OR a VenueRefused -- the
+            # venue's own documented rejection, or the adapter stopping before
+            # anything was sent. Kraken says no with HTTP 200 and an error
+            # list, so before this every Kraken rejection kept its row as
+            # "unknown, may be booked" and used up one of the day's orders.
+            definite = (isinstance(e, V.VenueRefused)
+                        or (msg.startswith("HTTP 4") and not msg.startswith("HTTP 408")))
+            if pending is not None and definite:
                 # A definite refusal (4xx): nothing was booked. Free the row so
                 # the caps do not charge for an order that never existed.
                 st["orders_today"] = [x for x in st.get("orders_today", []) if x is not pending]
@@ -916,6 +1450,7 @@ def hr(t):
 
 
 LAST_SEAL_OK = True   # set by run_once; main() turns a failed required seal into exit 3 so the scheduler sees it
+LAST_REFUSAL = None   # H2: set by run_once when the cycle was refused before it began; main() exits 4 on it
 
 
 def witness_ready(cfg, reserve=None):
@@ -927,11 +1462,31 @@ def witness_ready(cfg, reserve=None):
     today's quantities -- XRP's frozen floor included -- and the buy budget
     would re-anchor to today's book. Refusing the whole cycle is the only
     answer that writes nothing."""
-    if not witness.covenant_home(cfg):
+    # H6 (2026-11-12): an ARMED config is held to the pinned witness folder
+    # and may not carry a waiver, a reserve under the shipped floor, or a
+    # switched-off approval or Rule 5. Checked first: nothing below reads a
+    # folder that has not passed.
+    pin_why = witness.home_reasons(cfg)
+    if pin_why:
+        return "; ".join(pin_why)
+    if _guards is not None:
+        live_why = _guards.live_terms_reasons(cfg)
+        if live_why:
+            return "; ".join(live_why)
+    if not witness.effective_home(cfg):
         return ("covenant_home is not configured (env SENTINEL_COVENANT_HOME or "
                 "trader_config.json) -- the reserve floors, the seal and the "
                 "day's approval live in covenant")
     path = reserve or RESERVE_PATH
+    if isinstance(cfg, dict) and cfg.get("armed") and reserve is None:
+        # The floor file this process resolved when it started must be the
+        # pinned folder's. It is resolved from trader_config.json at import,
+        # so an armed config must name the pinned folder as covenant_home too.
+        want = os.path.join(witness.effective_home(cfg), "private", "RESERVE.json")
+        if os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.realpath(want)):
+            return ("armed, and the floor file this process resolved at start (%s) is not "
+                    "the pinned witness folder's (%s) -- refused; set covenant_home in "
+                    "trader_config.json to the pinned folder and start again" % (path, want))
     if not os.path.isfile(path):
         return ("covenant's reserve file is missing at %s -- Sentinel-Witness "
                 "never creates floors; restore it in covenant first" % path)
@@ -941,20 +1496,95 @@ def witness_ready(cfg, reserve=None):
     loose = witness.terms_reasons(cfg)
     if loose:
         return "; ".join(loose)
+    # H5 (2026-11-12): a config with a cap above its hard ceiling (or a cap
+    # that is not a number) refuses the cycle here, armed or not, for the same
+    # reason as the terms above -- nothing is read, planned or written on a
+    # config the program will not honour.
+    if _guards is not None:
+        over = _guards.config_reasons(cfg)
+        if over:
+            return "; ".join(over)
     return None
 
 
+def rehearsal_lines(cfg):
+    """What a DISARMED run prints when its config is looser than an armed one
+    may be. H6 (2026-11-12): the looser behaviour is kept for rehearsal, and
+    it is said to be that, every cycle, with each term named."""
+    if not isinstance(cfg, dict) or cfg.get("armed"):
+        return []
+    would = list(witness.home_reasons(cfg, hypothetical=True))
+    if _guards is not None:
+        would += _guards.live_terms_reasons(cfg, hypothetical=True)
+    if not would:
+        return []
+    out = ["  REHEARSAL ONLY -- disarmed, and this config would be REFUSED if armed:"]
+    out += ["    - " + w for w in would]
+    out.append("    Nothing below is a statement about what an armed cycle would do.")
+    return out
+
+
 def run_once(cfg, plan_only=False):
+    global LAST_REFUSAL
+    LAST_REFUSAL = None
+    # H7 (2026-11-12): AN ARMING THAT IS NOT COMPLETE AND CURRENT IS NO ARMING.
+    # The config may say armed and be missing its expiry, or past it; then the
+    # whole cycle runs DISARMED -- a rehearsal against the venues' dry-run
+    # endpoints -- and says so first. The config on disk is not edited.
+    arm_note = None
+    if isinstance(cfg, dict) and cfg.get("armed"):
+        ok_armed, arm_why = (_guards.arming(cfg) if _guards is not None
+                             else (False, "DISARMED: guards.py unavailable, so the arming cannot be checked"))
+        if not ok_armed:
+            arm_note = arm_why
+            cfg = dict(cfg)
+            cfg["armed"] = False
+    if arm_note:
+        print("\n  " + arm_note)
+        print("  This cycle runs DISARMED: nothing it does can book an order.")
     why = witness_ready(cfg)
     if why:
         hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
         print("  " + why)
         print("  Nothing was read, planned, sealed or sent.")
         return
-    st = roll_day(load_state())
+    try:
+        st = load_state()
+    except StateUnreadable as e:
+        # H2: stop here, with the reason, having written nothing.
+        aside = set_state_aside()
+        LAST_REFUSAL = ("trader state exists but cannot be read (%s) -- the day's order "
+                        "count, the lifetime buy total and the equity peak are UNKNOWN, "
+                        "and unknown is not zero" % e)
+        hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
+        print("  " + LAST_REFUSAL)
+        print("  state file : %s  (left exactly as it is; it was NOT overwritten)" % STATE)
+        print("  copy kept  : %s" % (aside or "COULD NOT BE WRITTEN -- copy the file by hand before repairing it"))
+        print("  Repair or restore the state file, or remove it only if you know this")
+        print("  trader has placed nothing today and bought nothing ever.")
+        print("  Nothing was read from a venue, planned, sealed or sent.")
+        return
+    try:
+        st = roll_day(st)
+    except ClockWentBack as e:
+        # H4: not a new day. Nothing is rolled, read, planned, sealed or saved.
+        LAST_REFUSAL = str(e)
+        hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
+        print("  " + LAST_REFUSAL)
+        print("  The day's order count was NOT reset and no approval was re-read.")
+        print("  If the record is wrong and the clock is right, last_seen_day and")
+        print("  last_seen_at in %s are the operator's to edit; this program only" % STATE)
+        print("  ever raises them.")
+        print("  Nothing was read from a venue, planned, sealed or sent.")
+        return
 
     hr(f"COVENANT TRADER   {time.strftime('%Y-%m-%d %H:%M')}"
-       + ("   [ARMED]" if cfg.get("armed") else "   [disarmed]"))
+       + (f"   [ARMED until {cfg.get('armed_until')}]" if cfg.get("armed") else "   [disarmed]"))
+    if arm_note:
+        print("  " + arm_note)
+
+    for line in rehearsal_lines(cfg):
+        print(line)
 
     nodes = node_status(cfg.get("node_ports") or [])
     print("  NODES")
@@ -978,6 +1608,11 @@ def run_once(cfg, plan_only=False):
         print(f"    {p['sym']:<6}{p['qty']:>16,.6f} {p['px']:>12,.6f} "
               f"{p['val']:>10,.2f} {pct:>6.1%}  {p['regime']:<4} "
               f"@{'+'.join(p['at'])}")
+    for p in pf.get("outside") or []:                                          # R3
+        pct = p["val"] / pf["total"] if pf["total"] else 0
+        print(f"    {p['sym']:<6}{p['qty']:>16,.6f} {p['px']:>12,.6f} "
+              f"{p['val']:>10,.2f} {pct:>6.1%}  held, not in `symbols`: counted in the "
+              f"total, never traded")
     for u in pf["unpriced"]:
         print(f"    {u['sym']:<6}{u['qty']:>16,.6f}  NO PRICE -- {u['why']}")
     if pf["total"]:
@@ -985,9 +1620,14 @@ def run_once(cfg, plan_only=False):
               f"cash {pf['cash']:,.2f} ({pf['cash']/pf['total']:.1%})")
 
     # equity history feeds the guards
+    # H3: an incomplete book is not the day's opening equity and not the
+    # starting book. The peak only ever rises, so an understated total cannot
+    # hurt it; the start-of-day figure and the once-only starting total are
+    # set only from a book that was read and priced whole.
+    book_whole = not book_incomplete(pf)
     if pf["total"]:
         st["equity_peak"] = max(st.get("equity_peak", 0.0), pf["total"])
-        if not st.get("equity_start_of_day"):
+        if not st.get("equity_start_of_day") and book_whole:
             st["equity_start_of_day"] = pf["total"]
 
     guard_blocks = []
@@ -1002,15 +1642,22 @@ def run_once(cfg, plan_only=False):
             equity_start_of_day=st["equity_start_of_day"],
             closed_trades=st.get("closed_trades", []),
             last_sold=st.get("last_sold", {}),
-            positions={p["sym"]: p["val"] for p in pf["positions"]},
+            # R3: the guards' book is the whole book -- a holding outside
+            # `symbols` is in it, or cash and every position read too large.
+            positions={p["sym"]: p["val"] for p in list(pf["positions"]) + list(pf.get("outside") or [])},
             cash=pf["cash"],
             orders_today=_guards.orders_today_from(st),
             # The ONLY place this is written, and only from a real portfolio
             # read -- see guards.set_starting_total for what went wrong when it
             # was two places.
-            starting_total_usd=_guards.set_starting_total(pf["total"], RESERVE_PATH),
+            starting_total_usd=(_guards.set_starting_total(pf["total"], RESERVE_PATH)
+                                if book_whole else _guards.starting_total(RESERVE_PATH)),
             bought_total_usd=st.get("bought_total_usd"),
             fiat_buys_week=list(st.get("fiat_buys", [])))
+        # G2: the book as measured this cycle goes into the state file (saved before execute),
+        # because guards.live_gate judges a buy against the record on disk and not against
+        # whatever State it is handed.
+        st["book"] = _guards.book_snapshot(state)
         for vd in _guards.GuardStack().evaluate(state):
             print(f"    [{'ok  ' if vd.allowed else 'BLOCK'}] {vd.guard:<14} {vd.reason}")
             # The two cap guards are shown here but NOT added to guard_blocks.
@@ -1022,9 +1669,19 @@ def run_once(cfg, plan_only=False):
             if not vd.allowed and vd.guard not in ("per_trade_cap", "per_day_cap"):
                 guard_blocks.append(vd.guard)
 
-    week_cut = time.time() - 7 * 86400
-    week_spent = sum(float(r.get("usd", 0)) for r in st.get("fiat_buys", []) if float(r.get("at", 0)) >= week_cut)
+    # H10: what the venues confirm was filled, before anything is planned or
+    # any sale is counted as proceeds.
+    for line in apply_fills(st, pf):
+        print(f"    fill: {line}")
+
+    # H1 (2026-11-12): the week's spend is read by the guard's own reader, so a
+    # row that is NaN, negative or unreadable makes it UNKNOWN (None) rather
+    # than a NaN sum; plan() then contributes nothing this week and says why.
+    _week = _guards.fiat_buys_week_from(st) if _guards else None
+    week_spent = None if _week is None else sum(r["usd"] for r in _week)
     orders, notes = plan(cfg, pf, week_spent=week_spent)
+    orders, _held_notes = drop_unresolved(orders, st)          # G7: see unresolved_symbols()
+    notes = list(notes) + _held_notes
     print("\n  PLAN")
     for n in notes:
         print(f"    - {n}")
@@ -1089,6 +1746,7 @@ def run_once(cfg, plan_only=False):
     snapshot = {"at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "total": round(pf["total"], 2), "cash": round(pf["cash"], 2),
                 "positions": {p["sym"]: round(p["val"], 2) for p in pf["positions"]},
+                "outside_symbols": {p["sym"]: round(p["val"], 2) for p in pf.get("outside") or []},
                 "regimes": {p["sym"]: p["regime"] for p in pf["positions"]},
                 "unpriced": [u["sym"] for u in pf["unpriced"]],
                 "orders": [{k: o[k] for k in ("sym", "side", "qty", "usd", "rule")} for o in orders],
@@ -1143,8 +1801,12 @@ def run_once(cfg, plan_only=False):
         ok, blocks, _v = _guards.GuardStack().may_buy(state, sym)
         return [] if ok else [b.guard for b in blocks]
 
+    # R1: the gate reads the state FILE. What this cycle has just learned --
+    # the day rolled, the clock marks, the Rule 5 record -- is written before
+    # any order is considered, so the file the gate judges is this cycle's.
+    save_state(st)
     results = execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only,
-                      may_buy=_may_buy)
+                      may_buy=_may_buy, portfolio=state)
     if results:
         print("\n  ORDERS")
         for r in results:
@@ -1162,13 +1824,35 @@ def run_once(cfg, plan_only=False):
 
 
 def cmd_status(cfg):
-    st = roll_day(load_state())
+    state_note = None
+    try:
+        st = roll_day(load_state())
+    except StateUnreadable as e:
+        # H2: status still prints; it says the state is unknown and shows no
+        # count as though it were known.
+        state_note = "UNREADABLE (%s) -- no cycle will run until it is repaired" % e
+        st = {}
+    except ClockWentBack as e:
+        state_note = "NOT ROLLED -- %s" % e                                   # H4
+        st = {}
     hr("STATUS")
     print(f"  armed              : {cfg.get('armed')}")
-    print(f"  halt file present  : {os.path.exists(HALT)}  ({os.path.basename(HALT)})")
+    if _guards is not None:                                                    # H7
+        _ok, _why = _guards.arming(cfg)
+        print(f"  armed until        : {cfg.get('armed_until')!r}")
+        print(f"  in effect          : {'ARMED -- ' + _why if _ok else _why}")
+    _hs = _guards.path_state(HALT) if _guards is not None else ("present" if os.path.exists(HALT) else "absent")
+    print(f"  halt file present  : {'no' if _hs == 'absent' else 'YES' if _hs == 'present' else 'COULD NOT BE CHECKED (' + _hs + ') -- treated as a halt'}  ({os.path.basename(HALT)})")
     print(f"  max order          : ${cfg['max_order_usd']:,.0f}")
     print(f"  daily notional cap : ${cfg['max_daily_notional_usd']:,.0f}")
     print(f"  orders per day     : {cfg['max_orders_per_day']}")
+    if _guards is not None:                                           # H5
+        hc = _guards.HARD_CEILINGS
+        print(f"  hard ceilings      : ${hc['max_order_usd']:,.0f} an order, "
+              f"${hc['max_daily_notional_usd']:,.0f} a day, {hc['max_orders_per_day']} orders a day "
+              f"(set in guards.py; a config may only lower them)")
+        for why in _guards.config_reasons(cfg):
+            print(f"  CONFIG REFUSED     : {why} -- no cycle will run")
     print(f"  seal required      : {cfg.get('seal_required')}")
     print(f"  Rule 5 threshold   : {st.get('sealed_signals', 0)} / "
           f"{cfg.get('min_sealed_signals')} sealed signals")
@@ -1179,6 +1863,13 @@ def cmd_status(cfg):
     sc = _guards.trading_scope(cfg) if _guards else None
     print(f"  sell reserve       : {'%.0f%% of every coin but XRP/HBAR/LINK (trading_scope, %s on %s)' % (sc['open_reserve_pct'] * 100, sc['by'], sc['at']) if sc else '50% of every coin but XRP/HBAR/LINK (no trading_scope record)'}; XRP/HBAR/LINK: frozen floor")
     print(f"  covenant (witness) : {witness.covenant_home(cfg) or 'NOT CONFIGURED -- no cycle will run'}")
+    _pin, _pin_why = witness.pinned_home()                                         # H6
+    print(f"  witness pin (armed): {_pin or 'NONE -- ' + _pin_why + '; an armed cycle will refuse'}")
+    for line in rehearsal_lines(cfg):
+        print(line)
+    if cfg.get("armed"):
+        for why in witness.home_reasons(cfg) + (_guards.live_terms_reasons(cfg) if _guards else []):
+            print(f"  ARMED CONFIG REFUSED: {why}")
     print(f"  reserve floors     : {RESERVE_PATH} ({'present' if os.path.isfile(RESERVE_PATH) else 'MISSING -- no cycle will run'})")
     print(f"  orders placed today: {len(st.get('orders_today', []))}")
     wk = sum(float(r.get("usd", 0)) for r in st.get("fiat_buys", [])
@@ -1186,7 +1877,7 @@ def cmd_status(cfg):
     print(f"  R6 contribution    : {'ON' if cfg.get('allow_fiat_buys') and float(cfg.get('weekly_fiat_budget_usd') or 0) > 0 else 'off'}"
           f" -- ${wk:,.2f} of ${float(cfg.get('weekly_fiat_budget_usd') or 0):,.2f} used this week")
     print(f"  XRPL record        : {'on (' + str(cfg.get('xrpl_network')) + ')' if cfg.get('xrpl_record') else 'off'}")
-    print(f"  state file         : {STATE}")
+    print(f"  state file         : {STATE}" + (f"  {state_note}" if state_note else ""))
     for v in V.all_venues():
         print(f"  {v.name:<18} : credential {'installed' if v.has_credentials() else 'MISSING'}")
     for n in node_status(cfg.get("node_ports") or []):
@@ -1241,6 +1932,11 @@ def main():
     # DID complete; refusing is the gate working. What must never print it is a
     # crash, and a crash cannot: run_once raises straight past this line.
     print("---- CYCLE COMPLETE %s ----" % datetime.date.today().strftime("%m/%d/%Y"))
+    if LAST_REFUSAL:
+        # H2: a cycle refused because the trader's own record is unreadable is
+        # not a clean run, and the scheduler's Last Result should say so.
+        print("  exit 4: the cycle was refused before it began -- " + LAST_REFUSAL[:160])
+        return 4
     if not LAST_SEAL_OK:
         # A required seal that failed used to leave Last Result 0 in the
         # scheduler and be visible only in trader_log.txt (2026-09-06 panel).

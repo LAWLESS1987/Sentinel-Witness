@@ -124,14 +124,24 @@ def book(T, st, order):
     ALLOWED through -- whether it is allowed at all is S4f/S4g's job, and
     satisfying armed + seal + Rule 5 here would test those twice and this once.
     All three are restored on the way out, including on a failure."""
-    saved = (T.V.all_venues, T.save_state, T.preconditions)
+    # R1 (2026-11-12): what makes an order live is no longer anything a caller
+    # hands to execute(). guards.live_gate judges the config and state on DISK, the
+    # witness and the venue, and this harness's dict -- armed, with the other gates
+    # switched off -- can no longer go live at all (test_r01_live_gate.py is where
+    # that is driven). What is under test HERE is the bookkeeping execute() does
+    # once an order IS allowed, so the gate is replaced for the length of the run,
+    # exactly as preconditions() is and for the same reason. Replacing a module's
+    # function from inside the process is the one door R1 does not, and cannot,
+    # close; a suite using it says so.
+    saved = (T.V.all_venues, T.save_state, T.preconditions, T._guards.live_gate)
     T.V.all_venues = lambda: [_StubVenue()]
     T.save_state = lambda _s: None
     T.preconditions = lambda *a, **k: []
+    T._guards.live_gate = lambda *a, **k: ([], "f7-bookkeeping-harness")
     try:
         T.execute({}, st, [dict(order, at={"stub": 1.0})], True, [])
     finally:
-        T.V.all_venues, T.save_state, T.preconditions = saved
+        T.V.all_venues, T.save_state, T.preconditions, T._guards.live_gate = saved
     return st
 
 
@@ -277,7 +287,10 @@ def main():
     # suite stayed 56/56). S4b greps for the delegating call, so it stays green
     # when the trader makes that call and then returns [] instead of its answer
     # -- the enforcement point silently emptied. These two ask the functions.
-    capcfg = {"armed": True, "daily_plan_required": False, "max_order_usd": 25.0, "min_order_usd": 5.0,   # the caps, not the plan gate (A106)
+    # H7 (2026-11-12): an arming carries an expiry (guards.arming); the two
+    # armed fixtures in this file arm for one hour. See test_h07_arming.py.
+    capcfg = {"armed": True, "armed_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)),
+              "daily_plan_required": False, "max_order_usd": 25.0, "min_order_usd": 5.0,   # the caps, not the plan gate (A106)
               "max_orders_per_day": 2, "max_daily_notional_usd": 50.0,
               "seal_required": False, "min_sealed_signals": 0,
               "rule5_require_significance": False}
@@ -405,16 +418,28 @@ def main():
         def has_credentials(self):
             return True
 
+        # H9 (2026-11-12): before a live order the trader asks the venue what its
+        # key may do (key_scope.key_reasons) and refuses a venue that cannot say.
+        # This stand-in answers as a trade-only key would. See test_h09_venue_keys.py.
+        def key_permissions(self, fetch=None):
+            return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "stand-in"}
+
         def place(self, sym, side, qty, live=False):
             self.calls.append((sym, side, qty, live))
             return {"descr": "fake", "txid": "TXFAKE"}
 
     _fv = _FakeVenue()
     _real_all = T.V.all_venues
+    # R1: B9b-B9d are about what execute() writes and asks once an order is
+    # allowed; the live gate is replaced for them, as in book() above (where
+    # the reason is written out), and restored after B9d.
+    _real_gate = T._guards.live_gate
+    T._guards.live_gate = lambda *a, **k: ([], "f7-bookkeeping-harness")
     _st = {"day": time.strftime("%Y-%m-%d"), "orders_today": [], "last_sold": {},
            "closed_trades": [], "bought_total_usd": 0.0, "equity_peak": 100.0,
            "equity_start_of_day": 100.0}
-    _cfg = dict(T.DEFAULT_CONFIG, armed=True, seal_required=False, daily_plan_required=False,   # the caps, not the plan gate (A106)
+    _cfg = dict(T.DEFAULT_CONFIG, armed=True, armed_until=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)),   # H7: armed for one hour
+                seal_required=False, daily_plan_required=False,   # the caps, not the plan gate (A106)
                 min_sealed_signals=0, rule5_require_significance=False)
     _order = {"sym": "XLM", "side": "sell", "qty": 10.0, "usd": 20.0,
               "rule": "test", "at": {"kraken": 10.0}}
@@ -469,6 +494,7 @@ def main():
     finally:
         T.V.all_venues = _real_all
         T.STATE = _saved_state_path
+    T._guards.live_gate = _real_gate
     check("B9d ...and it is NOT asked about a SALE -- a guard never stops a sale",
           _seen2 == [], _seen2)
 

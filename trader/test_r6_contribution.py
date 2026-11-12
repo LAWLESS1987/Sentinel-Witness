@@ -135,13 +135,31 @@ check(G.WeeklyBudget().budget == float(G.caps()["weekly_fiat_budget_usd"]),
 class _Stub:
     name = "stub"
     def has_credentials(self): return True
+    # H9 (2026-11-12): before a live order the trader asks the venue what its
+    # key may do (key_scope.key_reasons) and refuses a venue that cannot say.
+    # This stand-in answers as a trade-only key would. See test_h09_venue_keys.py.
+    def key_permissions(self, fetch=None):
+        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "stand-in"}
     def place(self, sym, side, qty, live=False, **kw): return {"descr": "ok", "txid": "t1"}
 
 _saved = []
 T.save_state = lambda s: _saved.append(1)
 T.venue_for = lambda o, lv: _Stub()
 T.V.all_venues = lambda: [_Stub()]
-armed = dict(BASE_CFG); armed.update({"armed": True, "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})   # R6, not the plan gate (A106)
+# R1 (2026-11-12): what makes an order live is no longer anything a caller
+# hands to execute(). guards.live_gate judges the config and state on DISK, the
+# witness and the venue, and this harness's dict -- armed, with the other gates
+# switched off -- can no longer go live at all (test_r01_live_gate.py is where
+# that is driven). What is under test HERE is the bookkeeping execute() does
+# once an order IS allowed, so the gate is replaced for the length of the run,
+# exactly as preconditions() is and for the same reason. Replacing a module's
+# function from inside the process is the one door R1 does not, and cannot,
+# close; a suite using it says so.
+_real_gate = T._guards.live_gate
+T._guards.live_gate = lambda *a, **k: ([], "r6-bookkeeping-harness")
+# H7 (2026-11-12): an arming carries an expiry (guards.arming); this fixture
+# arms for one hour. See test_h07_arming.py.
+armed = dict(BASE_CFG); armed.update({"armed": True, "armed_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)), "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})   # R6, not the plan gate (A106)
 state = {"sealed_signals": 30, "orders_today": [], "rule5": {"clears": True}, "day": "x", "fiat_buys": []}
 res = T.execute(armed, state, [{"sym": "XLM", "side": "buy", "qty": 25.0, "usd": 25.0, "rule": "R6 contribution"}],
                 sealed_ok=True, guard_blocks=[])

@@ -160,8 +160,16 @@ check(s["clears"] and s["p_value"] <= 0.05,
 
 # --- T: the trader applies both halves of the gate ---------------------------
 import covenant_trader as T          # noqa: E402
+# H7 (2026-11-12): AN ARMING NOW CARRIES AN EXPIRY. guards.arming() reads
+# `armed: true` as armed only with an `armed_until` that is an ISO time with
+# its zone, in the future and at most 24 hours ahead; without one the config
+# is DISARMED and every fixture below that arms would be refused for that
+# alone. So the fixtures arm for one hour from now. Nothing else about any
+# check is changed; the expiry itself is driven in test_h07_arming.py.
+import time as _time_h7
+_ARMED_UNTIL = _time_h7.strftime("%Y-%m-%dT%H:%M:%SZ", _time_h7.gmtime(_time_h7.time() + 3600))
 cfg = dict(T.DEFAULT_CONFIG)
-cfg.update({"armed": True, "seal_required": False, "rule5_require_significance": True, "daily_plan_required": False})   # Rule 5, not the plan gate (A106)
+cfg.update({"armed": True, "armed_until": _ARMED_UNTIL, "seal_required": False, "rule5_require_significance": True, "daily_plan_required": False})   # Rule 5, not the plan gate (A106)
 order = {"sym": "XLM", "side": "sell", "qty": 1, "usd": 10, "rule": "R1"}
 pf = {"total": 1000, "cash": 500, "positions": []}
 
@@ -191,6 +199,11 @@ class _Stub:
     name = "stub"
     def __init__(self, behaviour): self.b = behaviour
     def has_credentials(self): return True
+    # H9 (2026-11-12): before a live order the trader asks the venue what its
+    # key may do (key_scope.key_reasons) and refuses a venue that cannot say.
+    # This stand-in answers as a trade-only key would. See test_h09_venue_keys.py.
+    def key_permissions(self, fetch=None):
+        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "stand-in"}
     def place(self, sym, side, qty, live=False, **kw):
         if isinstance(self.b, Exception):
             raise self.b
@@ -199,7 +212,17 @@ class _Stub:
 _saved = []
 T.save_state = lambda st: _saved.append(json.dumps(st, sort_keys=True))
 armed = dict(T.DEFAULT_CONFIG)
-armed.update({"armed": True, "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})
+armed.update({"armed": True, "armed_until": _ARMED_UNTIL, "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})
+# R1 (2026-11-12): what makes an order live is no longer anything a caller
+# hands to execute(). guards.live_gate judges the config and state on DISK, the
+# witness and the venue, and this harness's dict -- armed, with the other gates
+# switched off -- can no longer go live at all (test_r01_live_gate.py is where
+# that is driven). What is under test HERE is the bookkeeping execute() does
+# once an order IS allowed, so the gate is replaced for the length of the run,
+# exactly as preconditions() is and for the same reason. Replacing a module's
+# function from inside the process is the one door R1 does not, and cannot,
+# close; a suite using it says so.
+T._guards.live_gate = lambda *a, **k: ([], "rule5-bookkeeping-harness")
 def run(stub):
     T.venue_for = lambda o, lv: stub
     T.V.all_venues = lambda: [stub]
