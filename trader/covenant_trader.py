@@ -431,6 +431,17 @@ def gather(cfg):
     # holding's value is, and plan() refuses on either. A venue with no
     # credential is not one of these: this machine holds nothing it can see there.
     venues_failed = []
+    # H10 (2026-11-12): WHAT IS ALREADY OPEN, AND WHAT HAS FILLED. A placed
+    # order was recorded and never looked at again: a limit order still
+    # resting on the book was invisible, so the next cycle planned the same
+    # sale on top of it, and its dollars counted as raised whether or not it
+    # ever filled. Each venue that can be read is now also asked for its open
+    # orders and for the day's fills, through the adapter's own
+    # open_orders_norm() and recent_fills() (a test hands in a fake venue).
+    # A venue whose open orders cannot be read is named, and plan() plans
+    # nothing; fills that cannot be read simply confirm nothing.
+    open_orders, open_unread, fills, fills_unread = [], [], {}, []
+    day_start = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
     for v in V.all_venues():
         if not v.has_credentials():
             venue_notes.append(f"{v.name}: no credential installed")
@@ -440,6 +451,26 @@ def gather(cfg):
         except V.VenueError as e:
             venue_notes.append(f"{v.name}: {e}")
             venues_failed.append(v.name)
+            continue
+        try:
+            rows = v.open_orders_norm()
+            if not isinstance(rows, list) or any(
+                    not isinstance(r, dict) or not isinstance(r.get("sym"), str) or not r["sym"].strip()
+                    for r in rows):
+                raise V.VenueError("the answer was not a list of orders naming a symbol")
+            open_orders += [dict(r, venue=v.name) for r in rows]
+        except Exception as e:                                   # noqa: BLE001
+            open_unread.append(v.name)
+            venue_notes.append(f"{v.name}: open orders could not be read ({type(e).__name__}: {str(e)[:100]})")
+        try:
+            got = v.recent_fills(day_start)
+            if not isinstance(got, list):
+                raise V.VenueError("the answer was not a list of fills")
+            fills[v.name] = got
+        except Exception as e:                                   # noqa: BLE001
+            fills_unread.append(v.name)
+            venue_notes.append(f"{v.name}: fills could not be read, so no sale there is confirmed "
+                               f"({type(e).__name__}: {str(e)[:100]})")
 
     # H1 (2026-11-12): A BALANCE THAT IS NOT A FINITE NUMBER AT OR ABOVE ZERO
     # is a venue that could not be read, not a holding of NaN units.
@@ -491,7 +522,47 @@ def gather(cfg):
     total = sum(p["val"] for p in positions) + cash
     return {"positions": positions, "cash": cash, "total": total,
             "unpriced": unpriced, "venue_notes": venue_notes,
-            "venues_read": sorted(per_venue), "venues_failed": sorted(venues_failed)}
+            "venues_read": sorted(per_venue), "venues_failed": sorted(venues_failed),
+            "open_orders": open_orders, "open_orders_unread": sorted(open_unread),
+            "fills": fills, "fills_unread": sorted(fills_unread)}
+
+
+FILL_COMPLETE = 0.98      # a fill of at least this share of the order is the order, filled
+
+
+def apply_fills(st, pf):
+    """Mark today's rows with what the venues confirm was filled. H10.
+
+    Only rows the trader wrote with a `fill` key are touched (a row from before
+    fills were tracked keeps its old meaning in guards._proceeds). A row is
+    matched to fills by the venue it went to and the order id the venue gave;
+    a row whose answer was lost has no id and stays unconfirmed. Returns the
+    lines to print."""
+    by_id = {}
+    for venue, rows in (pf.get("fills") or {}).items():
+        for f in rows if isinstance(rows, list) else []:
+            if not isinstance(f, dict):
+                continue
+            usd = f.get("usd")
+            if isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd != usd or usd < 0 \
+                    or usd == float("inf"):
+                continue
+            key = (venue, str(f.get("order_id")))
+            by_id[key] = by_id.get(key, 0.0) + float(usd)
+    notes = []
+    for row in st.get("orders_today", []) or []:
+        if not isinstance(row, dict) or row.get("fill") is None or not row.get("txid"):
+            continue
+        got = sum(by_id.get((row.get("venue"), i.strip()), 0.0) for i in str(row["txid"]).split(","))
+        if got <= 0:
+            continue
+        want = row.get("usd")
+        row["filled_usd"] = got
+        row["fill"] = ("CONFIRMED" if isinstance(want, (int, float)) and not isinstance(want, bool)
+                       and got >= FILL_COMPLETE * want else "PARTIAL")
+        notes.append("%s %s $%.2f at %s: %s, $%.2f filled"
+                     % (row.get("side"), row.get("sym"), want or 0.0, row.get("venue"), row["fill"], got))
+    return notes
 
 
 def book_incomplete(pf):
@@ -508,6 +579,10 @@ def book_incomplete(pf):
             out.append("%s has no price" % (u,))
     for name in pf.get("venues_failed") or []:
         out.append("venue %s could not be read" % name)
+    # H10: what is already open there is part of the book. Unknown, a sale
+    # could be planned on top of one that is still resting.
+    for name in pf.get("open_orders_unread") or []:
+        out.append("the open orders at %s could not be read" % name)
     return out
 
 
@@ -950,6 +1025,23 @@ def plan(cfg, pf, week_spent=0.0):
                     notes.append(f"R6 contribution: ${share:,.2f} into each of "
                                  f"{', '.join(p['sym'] for p in eligible[:n])} (${room:,.2f} room "
                                  f"this week, floor kept)")
+    # H10 (2026-11-12): NOTHING FOR A SYMBOL THAT ALREADY HAS AN ORDER OPEN.
+    # Applied last and by removal, so an order dropped here has still used its
+    # slot and its dollars in the sums above: the plan gets smaller, never
+    # larger, for it.
+    busy = {str(o.get("sym") or "").upper(): o for o in (pf.get("open_orders") or [])
+            if isinstance(o, dict)}
+    if busy:
+        kept = []
+        for o in orders:
+            hit = busy.get(str(o["sym"]).upper())
+            if hit is None:
+                kept.append(o)
+            else:
+                notes.append("open order: %s already has a %s order open at %s -- nothing is "
+                             "planned for it this cycle" % (o["sym"], hit.get("side") or "?",
+                                                            hit.get("venue") or "a venue"))
+        orders = kept
     return orders, notes
 
 
@@ -1010,6 +1102,20 @@ def preconditions(cfg, st, pf, order, sealed_ok, guard_blocks, approval=None,
             cache[name] = list(key_scope.key_reasons(venue))
         bad = list(cache[name])
     return bad
+
+
+def _place_kwargs(venue, **kw):
+    """The keyword arguments this venue's place() accepts, out of `kw`. Every
+    adapter in venues.py takes ref_px and client_ref (test_h10 pins that); a
+    stand-in in an older test takes neither and is called as it always was."""
+    import inspect
+    try:
+        params = inspect.signature(venue.place).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kw)
+    return {k: v for k, v in kw.items() if k in params}
 
 
 def _malformed_order(o):
@@ -1101,6 +1207,21 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
         go_live = not bad
         pending = None
         fiat_part = float(o["usd"])
+        # H10 (2026-11-12): THE REFERENCE PRICE AND THE CLIENT REFERENCE.
+        # ref_px is the planner's own price for this order (cross-venue
+        # checked); where an order carries none it is the price its own
+        # dollars and quantity imply. The venue adapter turns it into a limit
+        # no worse than venues.PRICE_BAND from it. cref is the same for the
+        # same (day, symbol, side, size, sequence) -- sequence being how many
+        # orders for this symbol and side today's record already holds.
+        ref_px = o.get("px")
+        if (isinstance(ref_px, bool) or not isinstance(ref_px, (int, float)) or ref_px != ref_px
+                or ref_px <= 0 or ref_px == float("inf")):
+            ref_px = float(o["usd"]) / float(o["qty"])
+        seq = sum(1 for r_ in st.get("orders_today", []) or []
+                  if isinstance(r_, dict) and r_.get("sym") == o["sym"] and r_.get("side") == o.get("side"))
+        cref = V.client_ref(st.get("day") or time.strftime("%Y-%m-%d"), o["sym"], o["side"],
+                            "%.8f" % float(o["qty"]), seq)
         if go_live:
             # THE FIAT PORTION IS MEASURED FIRST, from the day's sale headroom
             # before this order exists in orders_today -- appending first would
@@ -1127,11 +1248,15 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             # and the order was invisible to every guard (pre-push audit,
             # 2026-09-06). The row is completed below, or left saying UNKNOWN.
             pending = {"sym": o["sym"], "usd": o["usd"], "side": o.get("side"),
-                       "at": time.time(), "txid": None, "status": "PENDING"}
+                       "at": time.time(), "txid": None, "status": "PENDING",
+                       # H10: where it went, the reference it carries, and that
+                       # nothing has confirmed it filled yet.
+                       "venue": v.name, "client_ref": cref, "fill": "UNCONFIRMED"}
             st.setdefault("orders_today", []).append(pending)
             save_state(st)
         try:
-            r = v.place(o["sym"], o["side"], o["qty"], live=go_live)
+            r = v.place(o["sym"], o["side"], o["qty"], live=go_live,
+                        **_place_kwargs(v, ref_px=ref_px, client_ref=cref))
             results.append({**o, "status": "PLACED" if go_live else "VALIDATED",
                             "detail": r.get("descr") or "", "txid": r.get("txid"),
                             "blocked_by": bad, "venue": v.name})
@@ -1160,7 +1285,15 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                 save_state(st)
         except V.VenueError as e:
             msg = str(e)
-            if pending is not None and msg.startswith("HTTP 4"):
+            # H10: a definite refusal is a 4xx (but not 408, a timeout, which
+            # says nothing about what the venue did) OR a VenueRefused -- the
+            # venue's own documented rejection, or the adapter stopping before
+            # anything was sent. Kraken says no with HTTP 200 and an error
+            # list, so before this every Kraken rejection kept its row as
+            # "unknown, may be booked" and used up one of the day's orders.
+            definite = (isinstance(e, V.VenueRefused)
+                        or (msg.startswith("HTTP 4") and not msg.startswith("HTTP 408")))
+            if pending is not None and definite:
                 # A definite refusal (4xx): nothing was booked. Free the row so
                 # the caps do not charge for an order that never existed.
                 st["orders_today"] = [x for x in st.get("orders_today", []) if x is not pending]
@@ -1397,6 +1530,11 @@ def run_once(cfg, plan_only=False):
             # would weaken it to buys-only for a sell.
             if not vd.allowed and vd.guard not in ("per_trade_cap", "per_day_cap"):
                 guard_blocks.append(vd.guard)
+
+    # H10: what the venues confirm was filled, before anything is planned or
+    # any sale is counted as proceeds.
+    for line in apply_fills(st, pf):
+        print(f"    fill: {line}")
 
     # H1 (2026-11-12): the week's spend is read by the guard's own reader, so a
     # row that is NaN, negative or unreadable makes it UNKNOWN (None) rather

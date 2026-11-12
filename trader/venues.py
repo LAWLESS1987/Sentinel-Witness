@@ -50,6 +50,81 @@ class VenueError(Exception):
 #                           makes the signed call, a test hands in a fake.
 #                           covenant_trader asks key_scope.key_reasons(venue)
 #                           before any live order.
+# ============================================================================
+# H10 (2026-11-12): ORDER MECHANICS
+#
+# (a) A DEFINITE REFUSAL IS NOT "MAYBE BOOKED". covenant_trader.execute frees
+#     the day's row only for an answer that begins "HTTP 4". Kraken answers a
+#     rejected order with HTTP 200 and an `error` list, so every Kraken
+#     rejection -- insufficient funds, below the minimum, a bad argument --
+#     was booked as "unknown, may be booked" and used up one of the day's two
+#     orders. So were this file's own pre-flight refusals (a size that rounds
+#     to zero, a pair the venue does not list), which are raised before
+#     anything is sent. VenueRefused says: nothing was booked. It is a
+#     VenueError, so every existing handler still catches it.
+#
+# (b) A CLIENT REFERENCE ON EVERY LIVE ORDER, derived from (day, symbol, side,
+#     size, sequence) so the same order has the same reference however often
+#     it is retried, and can be found again afterwards. What it is worth
+#     differs by venue and is said where each is used.
+#
+# (c) NO ORDER WITHOUT A PRICE BAND. A market order takes whatever the book
+#     gives. With a reference price (the planner's own, cross-venue checked)
+#     an order is a LIMIT no worse than PRICE_BAND from it: a sale never
+#     below reference x (1 - band), a purchase never above reference x
+#     (1 + band).
+# ============================================================================
+class VenueRefused(VenueError):
+    """A definite refusal: the venue answered and booked nothing, or this
+    adapter stopped before anything was sent."""
+
+
+PRICE_BAND = 0.01          # 1%: the furthest a fill may be from the reference price
+
+
+def client_ref(day, symbol, side, size, seq):
+    """32 hex characters, the same for the same (day, symbol, side, size, seq)."""
+    return hashlib.sha256(("sentinel:%s:%s:%s:%s:%s" % (
+        day, str(symbol).upper(), str(side).lower(), size, seq)).encode()).hexdigest()[:32]
+
+
+def band_edge(side, ref_px, band=PRICE_BAND):
+    """The worst price this order may trade at, as a float."""
+    ref = float(ref_px)
+    if not (ref > 0 and ref == ref and ref != float("inf")):
+        raise VenueRefused("the reference price %r is not a finite number above zero" % (ref_px,))
+    return ref * (1.0 - band) if str(side).lower() == "sell" else ref * (1.0 + band)
+
+
+def within_band(side, price, ref_px, band=PRICE_BAND):
+    """True when `price` is no worse for this side than the band allows."""
+    edge = band_edge(side, ref_px, band)
+    return float(price) >= edge - 1e-12 if str(side).lower() == "sell" else float(price) <= edge + 1e-12
+
+
+def _grid(price, decimals, side):
+    """`price` on a grid of `decimals` places, as text: a sale's floor rounds
+    UP and a purchase's ceiling rounds DOWN, so rounding never widens the band."""
+    from decimal import Decimal, ROUND_DOWN, ROUND_UP
+    q = Decimal(1).scaleb(-int(decimals))
+    d = Decimal(str(price)).quantize(q, rounding=ROUND_UP if str(side).lower() == "sell" else ROUND_DOWN)
+    return format(d, "f")
+
+
+def _iso_epoch(s):
+    """Epoch seconds for an RFC 3339 time that carries its zone, or None."""
+    import datetime, re
+    try:
+        t = str(s).strip()
+        if t[-1:] in "Zz":
+            t = t[:-1] + "+00:00"
+        t = re.sub("[.]([0-9]{1,6})[0-9]*", lambda m: "." + m.group(1), t)   # at most microseconds
+        d = datetime.datetime.fromisoformat(t)
+        return d.timestamp() if d.tzinfo is not None else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
 def _own_credential(path):
     try:
         key_scope.refuse_shared_credential(path)
@@ -171,11 +246,30 @@ class KrakenVenue:
                      "Content-Type": "application/x-www-form-urlencoded"})
         body = _http(req)
         if body.get("error"):
-            errs = "; ".join(body["error"])
+            errs = "; ".join(str(e) for e in body["error"])
+            definite = all(self.definite_refusal(e) for e in body["error"])
             if "Permission denied" in errs:
                 errs += "  -> this key lacks the permission for that call"
-            raise VenueError(f"kraken: {errs}")
+            # H10: Kraken says no with HTTP 200 and this list. Where EVERY
+            # entry is one of its documented rejections, nothing was booked.
+            raise (VenueRefused if definite else VenueError)(f"kraken: {errs}")
         return body.get("result", {})
+
+    # H10. Kraken's documented error strings that mean the request was
+    # rejected: every EOrder: (order-level rejections -- insufficient funds,
+    # order minimum not met, cannot open position ...), and these named ones.
+    # EService:Unavailable, EService:Busy, EService:Deadline elapsed ("the
+    # order may have been placed despite the timeout"), EGeneral:Internal
+    # error and anything not listed stay AMBIGUOUS: the row stays in the day's
+    # record as unknown.  docs.kraken.com/exchange/guides/general/errors
+    DEFINITE_ERRORS = ("EGeneral:Invalid arguments", "EGeneral:Permission denied",
+                       "EAPI:Invalid key", "EAPI:Invalid signature", "EAPI:Invalid nonce",
+                       "EAPI:Rate limit exceeded")
+
+    @classmethod
+    def definite_refusal(cls, err):
+        e = str(err).strip()
+        return e.startswith("EOrder:") or any(e.startswith(d) for d in cls.DEFINITE_ERRORS)
 
     # -- market metadata ----------------------------------------------------
     def pairs(self):
@@ -191,7 +285,8 @@ class KrakenVenue:
                 continue
             ws = (v.get("wsname") or "")
             sym = ws.split("/")[0] if "/" in ws else v.get("base", "")
-            meta = {"pair": name, "symbol": sym,
+            meta = {"pair": name, "symbol": sym, "altname": v.get("altname") or "",
+                    "wsname": ws,
                     "lot_decimals": int(v.get("lot_decimals", 8)),
                     "pair_decimals": int(v.get("pair_decimals", 5)),
                     "ordermin": float(v.get("ordermin", 0) or 0),
@@ -236,35 +331,116 @@ class KrakenVenue:
                       (fetch or (lambda: self._private("GetApiKeyInfo")))())
 
     # -- orders -------------------------------------------------------------
-    def place(self, symbol, side, qty, live=False, ordertype="market", price=None):
+    LIVE_ORDER = "limit, immediate-or-cancel, no worse than PRICE_BAND from the reference price"
+
+    def place(self, symbol, side, qty, live=False, ordertype="market", price=None,
+              ref_px=None, client_ref=None):
         """side is 'buy'/'sell'. Returns a dict describing what happened.
 
         live=False sends Kraken's own `validate=true`: the order is fully
         parsed and checked against your balance and the pair minimums, and
         nothing is booked. That is a real check against the real venue, not a
         simulation written here -- which is the point.
+
+        H10. With `ref_px` the order is never a market order: it is a LIMIT at
+        the band's edge (band_edge), immediate-or-cancel -- it fills at once at
+        the book's price when that is inside the band, and otherwise cancels
+        instead of resting. `client_ref` travels as Kraken's cl_ord_id on a
+        live order. WHAT THAT IS WORTH: Kraken checks cl_ord_id for uniqueness
+        among OPEN orders only (docs.kraken.com/exchange/guides/general/
+        clordid), so it is NOT an idempotency key for an order that has
+        already closed. It is the handle OpenOrders and ClosedOrders can be
+        asked by.
         """
-        m = self.meta(symbol)
+        try:
+            m = self.meta(symbol)
+        except VenueError as e:
+            # Whatever went wrong finding the pair, no order has been sent.
+            raise VenueRefused(f"{e} (nothing was sent)") from None
         vol = _round_down(float(qty), m["lot_decimals"])
         if vol <= 0:
-            raise VenueError(f"{symbol}: quantity rounds to zero at "
-                             f"{m['lot_decimals']} decimals")
+            raise VenueRefused(f"{symbol}: quantity rounds to zero at "
+                               f"{m['lot_decimals']} decimals")
         if m["ordermin"] and vol < m["ordermin"]:
-            raise VenueError(f"{symbol}: {vol} is below Kraken's minimum "
-                             f"{m['ordermin']}")
+            raise VenueRefused(f"{symbol}: {vol} is below Kraken's minimum "
+                               f"{m['ordermin']}")
+        if ref_px is not None and ordertype == "market":
+            ordertype, price = "limit", band_edge(side, ref_px)
+            tif = "IOC"
+        else:
+            tif = None
         data = {"pair": m["pair"], "type": side, "ordertype": ordertype,
                 "volume": f"{vol:.{m['lot_decimals']}f}".rstrip("0").rstrip(".")}
         if ordertype == "limit":
             if price is None:
-                raise VenueError("limit order needs a price")
-            data["price"] = f"{_round_down(price, m['pair_decimals']):.{m['pair_decimals']}f}"
+                raise VenueRefused("limit order needs a price")
+            if ref_px is not None:
+                if not within_band(side, price, ref_px):
+                    raise VenueRefused(f"{symbol}: limit {price} is outside the "
+                                       f"{PRICE_BAND:.0%} band around {ref_px}")
+                data["price"] = _grid(price, m["pair_decimals"], side)
+            else:
+                data["price"] = f"{_round_down(price, m['pair_decimals']):.{m['pair_decimals']}f}"
+            if tif:
+                data["timeinforce"] = tif
         if not live:
             data["validate"] = "true"
+        elif client_ref:
+            data["cl_ord_id"] = str(client_ref)
         res = self._private("AddOrder", data)
+        txid = res.get("txid")
+        if isinstance(txid, list):                  # Kraken returns a list of ids
+            txid = txid[0] if len(txid) == 1 else (",".join(str(x) for x in txid) or None)
         return {"venue": self.name, "live": live, "symbol": symbol, "side": side,
-                "qty": vol, "pair": m["pair"],
+                "qty": vol, "pair": m["pair"], "ordertype": ordertype,
+                "price": data.get("price"), "client_ref": data.get("cl_ord_id"),
                 "descr": (res.get("descr") or {}).get("order"),
-                "txid": res.get("txid")}
+                "txid": txid}
+
+    # -- reading orders back (H10) ---------------------------------------------
+    def _sym_of_pair(self, pair):
+        """Kraken names a pair three ways (XXLMZUSD, XLMUSD, XLM/USD). The
+        symbol it trades, or VenueError if it is none of ours."""
+        want = str(pair or "").upper()
+        for sym, m in self.pairs().items():
+            names = {str(m.get("pair") or "").upper(), str(m.get("altname") or "").upper(),
+                     str(m.get("wsname") or "").upper(), str(m.get("wsname") or "").upper().replace("/", "")}
+            if want and want in names:
+                return {"XBT": "BTC", "XDG": "DOGE"}.get(sym, sym)
+        raise VenueError("kraken: an order names the pair %r, which is not a USD pair this "
+                         "adapter knows" % (pair,))
+
+    def open_orders_norm(self, fetch=None):
+        """Open orders as [{"sym", "side", "id", "client_ref"}]. `fetch`
+        returns OpenOrders' `result`."""
+        res = (fetch or (lambda: self._private("OpenOrders")))()
+        rows = res.get("open") if isinstance(res, dict) else None
+        if not isinstance(rows, dict):
+            raise VenueError("kraken: OpenOrders returned no `open` object")
+        out = []
+        for txid, o in rows.items():
+            d = (o or {}).get("descr") or {}
+            out.append({"sym": self._sym_of_pair(d.get("pair")), "side": str(d.get("type") or "").lower(),
+                        "id": str(txid), "client_ref": (o or {}).get("cl_ord_id")})
+        return out
+
+    def recent_fills(self, since=None, fetch=None):
+        """Trades since `since` (epoch seconds) as [{"order_id", "sym", "side",
+        "usd", "qty", "at"}]. `fetch` returns TradesHistory's `result`."""
+        data = {"start": str(int(since))} if since else {}
+        res = (fetch or (lambda: self._private("TradesHistory", data)))()
+        rows = res.get("trades") if isinstance(res, dict) else None
+        if not isinstance(rows, dict):
+            raise VenueError("kraken: TradesHistory returned no `trades` object")
+        out = []
+        for t in rows.values():
+            try:
+                out.append({"order_id": str(t["ordertxid"]), "sym": self._sym_of_pair(t.get("pair")),
+                            "side": str(t.get("type") or "").lower(), "usd": float(t["cost"]),
+                            "qty": float(t["vol"]), "at": float(t["time"])})
+            except (KeyError, TypeError, ValueError):
+                raise VenueError("kraken: a trade in TradesHistory cannot be read") from None
+        return out
 
 
 # ------------------------------------------------------------------- Coinbase
@@ -417,6 +593,48 @@ class CoinbaseVenue:
         js = self._call("GET", "/api/v3/brokerage/orders/historical/batch?order_status=OPEN")
         return js.get("orders", [])
 
+    # -- reading orders back (H10) ---------------------------------------------
+    def open_orders_norm(self, fetch=None):
+        """Open orders as [{"sym", "side", "id", "client_ref"}]. `fetch`
+        returns the list of order objects."""
+        rows = (fetch or self.open_orders)()
+        if not isinstance(rows, list):
+            raise VenueError("coinbase: the open-orders answer was not a list")
+        out = []
+        for o in rows:
+            pid = str((o or {}).get("product_id") or "")
+            if "-" not in pid:
+                raise VenueError("coinbase: an open order names no product")
+            out.append({"sym": pid.split("-")[0].upper(), "side": str(o.get("side") or "").lower(),
+                        "id": str(o.get("order_id") or ""), "client_ref": o.get("client_order_id")})
+        return out
+
+    def recent_fills(self, since=None, fetch=None):
+        """Fills since `since` (epoch seconds) as [{"order_id", "sym", "side",
+        "usd", "qty", "at"}]. `fetch` returns the list of fill objects."""
+        def _get():
+            q = ""
+            if since:
+                q = "?start_sequence_timestamp=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+            return self._call("GET", "/api/v3/brokerage/orders/historical/fills" + q).get("fills", [])
+        rows = (fetch or _get)()
+        if not isinstance(rows, list):
+            raise VenueError("coinbase: the fills answer was not a list")
+        out = []
+        for f in rows:
+            try:
+                if str(f.get("trade_type") or "FILL").upper() != "FILL":
+                    continue                      # reversals and corrections are not fills
+                px, size = float(f["price"]), float(f["size"])
+                usd = size if f.get("size_in_quote") else px * size
+                qty = (size / px) if f.get("size_in_quote") else size
+                out.append({"order_id": str(f["order_id"]), "sym": str(f["product_id"]).split("-")[0].upper(),
+                            "side": str(f.get("side") or "").lower(), "usd": usd, "qty": qty,
+                            "at": _iso_epoch(f.get("trade_time"))})
+            except (KeyError, TypeError, ValueError, ZeroDivisionError, AttributeError):
+                raise VenueError("coinbase: a fill cannot be read") from None
+        return out
+
     # -- what this key may do (H9) -------------------------------------------
     KEY_SCOPE_ENDPOINT = "GET /api/v3/brokerage/key_permissions"
 
@@ -470,11 +688,25 @@ class CoinbaseVenue:
         # keeps it out of exponent notation ("1E+2" -> "100").
         return format(out.normalize(), "f")
 
-    def place(self, symbol, side, qty, live=False, ordertype=None, price=None, day=None):
+    LIVE_ORDER = "limit, post-only at the touch, good for MAKER_TTL_S, no worse than PRICE_BAND from the reference price"
+
+    def place(self, symbol, side, qty, live=False, ordertype=None, price=None, day=None,
+              ref_px=None, client_ref=None):
         """ordertype: None -> the venue default (post-only maker at the touch when
         MAKER_BY_DEFAULT, else market); "market" -> take, deliberately;
-        "maker" -> post-only at the touch; "limit" -> post-only GTD at `price`."""
-        m = self.meta(symbol)
+        "maker" -> post-only at the touch; "limit" -> post-only GTD at `price`.
+
+        H10. With `ref_px` the order must be a limit and its price must be
+        inside PRICE_BAND of the reference -- a touch that has moved outside
+        the band since the plan was priced is refused here, before anything is
+        sent. `client_ref`, when given, is the client_order_id: Coinbase
+        returns the EXISTING order for a client_order_id it has already seen
+        rather than creating another, so here it is a real idempotency key."""
+        try:
+            m = self.meta(symbol)
+        except VenueError as e:
+            # Whatever went wrong finding the product, no order has been sent.
+            raise VenueRefused(f"{e} (nothing was sent)") from None
         # Size on the base grid the same exact way as price: Decimal, rounded
         # down, formatted without an exponent. str(float) wrote 4.5e-05 for
         # small sizes and _round_down's float truncation could take one
@@ -482,11 +714,11 @@ class CoinbaseVenue:
         size_s = self._snap(qty, m["base_increment"], "BUY")
         size = float(size_s)
         if size <= 0:
-            raise VenueError(f"{symbol}: quantity rounds to zero at the "
-                             f"product's base increment {m['base_increment']}")
+            raise VenueRefused(f"{symbol}: quantity rounds to zero at the "
+                               f"product's base increment {m['base_increment']}")
         if m["base_min_size"] and size < m["base_min_size"]:
-            raise VenueError(f"{symbol}: {size} is below Coinbase's minimum "
-                             f"{m['base_min_size']}")
+            raise VenueRefused(f"{symbol}: {size} is below Coinbase's minimum "
+                               f"{m['base_min_size']}")
         # FEES. Advanced Trade charges the taker rate on anything that crosses
         # the book (every market order) and the lower maker rate on anything
         # that rests. The default is therefore "maker": a post-only limit at
@@ -499,14 +731,24 @@ class CoinbaseVenue:
         if ordertype is None:
             ordertype = "maker" if self.MAKER_BY_DEFAULT else "market"
         if ordertype == "maker":
-            bid, ask = self.best_bid_ask(m["product_id"])
+            try:
+                bid, ask = self.best_bid_ask(m["product_id"])
+            except VenueError as e:
+                raise VenueRefused(f"{e} (nothing was sent)") from None
             price = bid if side.upper() == "BUY" else ask
         if ordertype == "market":
+            if ref_px is not None:
+                raise VenueRefused(f"{symbol}: a market order has no price band; with a "
+                                   f"reference price the order must be a limit")
             cfg = {"market_market_ioc": {"base_size": size_s}}
         else:
             if price is None:
-                raise VenueError(f"{symbol}: a limit order needs a price")
+                raise VenueRefused(f"{symbol}: a limit order needs a price")
             price = self._snap(price, m["quote_increment"], side)
+            if ref_px is not None and not within_band(side, float(price), ref_px):
+                raise VenueRefused(f"{symbol}: the price {price} is outside the "
+                                   f"{PRICE_BAND:.0%} band around the reference {ref_px} -- "
+                                   f"nothing was sent")
             end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + self.MAKER_TTL_S))
             cfg = {"limit_limit_gtd": {"base_size": size_s, "limit_price": price,
                                        "end_time": end, "post_only": True}}
@@ -527,11 +769,13 @@ class CoinbaseVenue:
             # too. The caps allow two orders a day and the planner never emits
             # two identical trims, so that case does not arise from this code.
             day = day or time.strftime("%Y-%m-%d")
-            body["client_order_id"] = hashlib.sha256(
+            body["client_order_id"] = str(client_ref) if client_ref else hashlib.sha256(
                 f"covenant:{day}:{m['product_id']}:{side.upper()}:{size_s}".encode()).hexdigest()[:32]
         res = self._call("POST", path, body)
         if live and not res.get("success", True):
-            raise VenueError(f"coinbase refused: {json.dumps(res)[:300]}")
+            # H10: Coinbase answered, and the answer is success=false with an
+            # error_response. Nothing was booked.
+            raise VenueRefused(f"coinbase refused: {json.dumps(res)[:300]}")
         if not live and res.get("errs"):
             raise VenueError(f"coinbase preview rejected: {json.dumps(res['errs'])[:300]}")
         return {"venue": self.name, "live": live, "symbol": symbol, "side": side,
@@ -677,15 +921,45 @@ class RobinhoodVenue:
         res = self._call("GET", "/api/v1/crypto/trading/orders/?state=open")
         return res.get("results") or []
 
+    # -- reading orders back (H10) ---------------------------------------------
+    def open_orders_norm(self, fetch=None):
+        """Open orders as [{"sym", "side", "id", "client_ref"}]. `fetch`
+        returns the list of order objects."""
+        rows = (fetch or self.open_orders)()
+        if not isinstance(rows, list):
+            raise VenueError("robinhood: the open-orders answer was not a list")
+        out = []
+        for o in rows:
+            pair = str((o or {}).get("symbol") or "")
+            if "-" not in pair:
+                raise VenueError("robinhood: an open order names no pair")
+            out.append({"sym": pair.split("-")[0].upper(), "side": str(o.get("side") or "").lower(),
+                        "id": str(o.get("id") or ""), "client_ref": o.get("client_order_id")})
+        return out
+
+    def recent_fills(self, since=None, fetch=None):
+        # NOT IMPLEMENTED, and said so rather than guessed: the fields a
+        # filled order carries were not confirmed from this venue's
+        # documentation, so no fill here is ever "confirmed" and no sale at
+        # this venue counts as proceeds.
+        raise VenueError("robinhood: fills are not read by this adapter (the response "
+                         "fields are UNDETERMINED from its documentation)")
+
+    LIVE_ORDER = "limit at the band's edge, no worse than PRICE_BAND from the reference price"
+
     def place(self, symbol, side, qty, live=False, ordertype="market",
-              price=None):
+              price=None, ref_px=None, client_ref=None):
         if side.lower() not in ("buy", "sell"):
-            raise VenueError(f"robinhood: bad side {side!r}")
-        m = self.meta(symbol)
+            raise VenueRefused(f"robinhood: bad side {side!r}")
+        try:
+            m = self.meta(symbol)
+        except VenueError as e:
+            # Whatever went wrong finding the pair, no order has been sent.
+            raise VenueRefused(f"{e} (nothing was sent)") from None
         size = float(qty)
         if m["ordermin"] and size < m["ordermin"]:
-            raise VenueError(f"robinhood: {size} {symbol} is under the "
-                             f"minimum order size {m['ordermin']}")
+            raise VenueRefused(f"robinhood: {size} {symbol} is under the "
+                               f"minimum order size {m['ordermin']}")
         if not live:
             # LOCAL ONLY -- see the class docstring. There is no venue-side
             # preview to call, so this reports what was checked HERE and
@@ -700,9 +974,30 @@ class RobinhoodVenue:
                              f"endpoint, so balance and buying power were "
                              f"NOT checked by the venue.",
                     "txid": None}
-        body = {"symbol": m["pair"], "client_order_id": secrets.token_hex(16),
+        # H10. The client_order_id was secrets.token_hex(16): new on every
+        # attempt, so a retry of an order this venue had in fact accepted was a
+        # second order. It is now the caller's reference, written as the UUID
+        # the venue asks for ("for idempotency validation"). And with a
+        # reference price the order is a LIMIT at the band's edge
+        # (limit_order_config: asset_quantity, limit_price), not a market
+        # order. How long such an order rests if it does not fill at once is
+        # UNDETERMINED from the documentation read; covenant_trader plans
+        # nothing for a symbol that has an order open.
+        import uuid
+        ref = str(client_ref) if client_ref else secrets.token_hex(16)
+        try:
+            coid = str(uuid.UUID(hex=ref[:32]))
+        except ValueError:
+            coid = str(uuid.uuid5(uuid.NAMESPACE_OID, ref))
+        config = {"asset_quantity": str(size)}
+        if ref_px is not None:
+            ordertype = "limit"
+            inc = str(m.get("increment") or "0.01")
+            decimals = max(0, len(inc.split(".")[1].rstrip("0")) if "." in inc else 0)
+            config["limit_price"] = _grid(band_edge(side, ref_px), decimals, side)
+        body = {"symbol": m["pair"], "client_order_id": coid,
                 "side": side.lower(), "type": ordertype,
-                f"{ordertype}_order_config": {"asset_quantity": str(size)}}
+                f"{ordertype}_order_config": config}
         res = self._call("POST", "/api/v1/crypto/trading/orders/", body)
         return {"venue": self.name, "live": True, "venue_validated": True,
                 "symbol": symbol.upper(), "side": side.lower(), "qty": size,

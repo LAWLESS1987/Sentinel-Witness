@@ -122,6 +122,15 @@ class V1:
             raise T.V.VenueError(self._err)
         return dict(self._bal)
 
+    # H10: gather() also asks a venue what is open there and what has filled;
+    # a venue that cannot say is one whose open orders are unread, which is its
+    # own way for the book to be incomplete (test_h10_order_mechanics.py).
+    def open_orders_norm(self):
+        return []
+
+    def recent_fills(self, since=None):
+        return []
+
 
 def run_gather(venues):
     keep_all, keep_pre = T.V.all_venues, T.daily.prefetch

@@ -894,7 +894,25 @@ def _proceeds(orders):
         if usd is None:
             return None
         if side == "sell":
-            sold += usd
+            # H10 (2026-11-12): A SALE IS PROCEEDS ONLY FOR WHAT A VENUE HAS
+            # CONFIRMED FILLED. A row the trader writes now carries `fill`:
+            # UNCONFIRMED when the order is placed, then PARTIAL or CONFIRMED
+            # with `filled_usd` once the venue's own fills say so
+            # (covenant_trader.apply_fills). A resting limit order that never
+            # fills raised nothing, and used to count in full the moment it
+            # was placed. A row with no `fill` key was written before fills
+            # were tracked and counts as it always did; a `fill` this does not
+            # know makes the day unknown.
+            fill = o.get("fill")
+            if fill is None:
+                sold += usd
+            elif fill in ("UNCONFIRMED", "PARTIAL", "CONFIRMED"):
+                got = finite_nonnegative(o.get("filled_usd", 0.0))
+                if got is None:
+                    return None
+                sold += got
+            else:
+                return None
         elif side == "buy":
             bought += usd
         else:
