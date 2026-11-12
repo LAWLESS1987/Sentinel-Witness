@@ -75,6 +75,67 @@ BAD_AMOUNT = "order amount is not a finite number above zero"
 BAD_SIDE = "order side is not exactly 'buy' or 'sell'"
 
 
+# ---- H4 (2026-11-12): THE CLOCK ONLY GOES FORWARD ----------------------------
+# The day rolled over whenever the stored date merely DIFFERED from today's.
+# Set the clock back a day, or cross a time zone westward near midnight, and
+# the stored day "differs": the day's order count was cleared, the daily caps
+# started again, and yesterday's approved plan was today's once more. So the
+# state keeps the latest local day and the latest moment this trader has seen
+# (last_seen_day, last_seen_at), only ever raised, and a clock that reads
+# earlier than either is a refusal, not a new day.
+CLOCK_BACK = "clock: the date or time reads EARLIER than this trader has already seen"
+CLOCK_SLACK_S = 300.0     # an ordinary time-sync correction is not a clock set back
+
+
+def local_day(now=None):
+    """The local calendar day, YYYY-MM-DD -- the one reading roll_day,
+    orders_today_from and covenant's daily plan (time.localtime) all use."""
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() if now is None else now))
+
+
+def is_day(s):
+    """True for a real calendar date written YYYY-MM-DD, and nothing else."""
+    if not isinstance(s, str) or len(s) != 10:
+        return False
+    try:
+        return time.strftime("%Y-%m-%d", time.strptime(s, "%Y-%m-%d")) == s
+    except ValueError:
+        return False
+
+
+def clock_back(trader_state, now=None):
+    """Why the clock reads earlier than the trader's own record, or None.
+
+    Reads `last_seen_day` and `day` (dates sort as text) and `last_seen_at`
+    (epoch seconds, with CLOCK_SLACK_S of tolerance). A `last_seen_day` or
+    `last_seen_at` that is present and is not a date or a finite number is a
+    reason too: the mark that says how far the clock has been cannot be read,
+    so it cannot be shown not to have gone back."""
+    if not isinstance(trader_state, dict):
+        return None
+    t = time.time() if now is None else now
+    if finite_number(t) is None:
+        return CLOCK_BACK + " (the time now is not a finite number)"
+    today = local_day(t)
+    lsd = trader_state.get("last_seen_day")
+    if lsd is not None and not is_day(lsd):
+        return CLOCK_BACK + " (last_seen_day %r in the trader's state is not a date)" % (lsd,)
+    seen = [d for d in (lsd, trader_state.get("day")) if is_day(d)]
+    if seen and today < max(seen):
+        return (CLOCK_BACK + ": today reads %s and the last day on record is %s. Nothing "
+                "runs until the date is at or after it; correct the clock" % (today, max(seen)))
+    lsa = trader_state.get("last_seen_at")
+    if lsa is not None:
+        at = finite_number(lsa)
+        if at is None:
+            return CLOCK_BACK + " (last_seen_at %r in the trader's state is not a finite number)" % (lsa,)
+        if t < at - CLOCK_SLACK_S:
+            return (CLOCK_BACK + ": the time now is %d s before the last cycle on record "
+                    "(more than the %d s allowed for a time-sync correction)"
+                    % (int(at - t), int(CLOCK_SLACK_S)))
+    return None
+
+
 @dataclass
 class Verdict:
     allowed: bool
@@ -535,6 +596,12 @@ def orders_today_from(trader_state: Optional[dict], now: Optional[float] = None)
     if trader_state is None:
         return None
     if not isinstance(trader_state, dict):
+        return None
+    # H4: a clock that reads earlier than the record is not a new day. The
+    # day's orders are then UNKNOWN (None), and the cap guards block on that --
+    # where this used to answer [] ("a stale day, nothing placed") and hand the
+    # whole day's count back.
+    if clock_back(trader_state, now) is not None:
         return None
     day = time.strftime("%Y-%m-%d", time.localtime(now if now is not None else time.time()))
     if trader_state.get("day") != day:
@@ -1261,6 +1328,10 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
 
     if not cfg.get("armed"):
         bad.append("armed=false in trader_config.json")
+    # H4: said in its own words as well as through the caps going unknown.
+    _clock = clock_back(st, now)
+    if _clock:
+        bad.append(_clock)
     if os.path.exists(HALT):
         bad.append("TRADER_HALT file present")
     # A halt dropped in covenant stops this trader too: whoever reaches for

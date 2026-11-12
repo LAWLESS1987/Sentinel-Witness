@@ -168,7 +168,12 @@ def _state_problem(st):
     for key, kind in _STATE_SHAPE:
         if key in st and not isinstance(st[key], kind):
             return "%r is a %s, not a %s" % (key, type(st[key]).__name__, kind.__name__)
-    for key in _STATE_NUMBERS:
+    # H4: the day marks. "" is "no day yet"; anything else must be a date.
+    for key in ("day", "last_seen_day"):
+        v = st.get(key)
+        if v not in (None, "") and not (_guards.is_day(v) if _guards else False):
+            return "%r is %r, not a date written YYYY-MM-DD" % (key, v)
+    for key in _STATE_NUMBERS + ("last_seen_at",):
         if key in st:
             v = st[key]
             if (isinstance(v, bool) or not isinstance(v, (int, float)) or v != v
@@ -251,14 +256,32 @@ def save_state(st):
     durable.write_json(STATE, st, indent=2)
 
 
-def roll_day(st):
-    today = time.strftime("%Y-%m-%d")
+class ClockWentBack(Exception):
+    """The date or time reads earlier than this trader has already seen. H4."""
+
+
+def roll_day(st, now=None):
+    # H4 (2026-11-12): THE DAY ROLLS FORWARD ONLY. This compared the stored
+    # day with today's and rolled when they DIFFERED, so a clock set back a
+    # day (or a time zone crossed westward near midnight) cleared the day's
+    # orders and made an old approval current again. guards.clock_back reads
+    # the latest day and moment on record; earlier than either raises, and
+    # run_once refuses the cycle. The two marks are only ever raised.
+    now_t = time.time() if now is None else now
+    today = time.strftime("%Y-%m-%d", time.localtime(now_t))
+    if _guards is not None:
+        why = _guards.clock_back(st, now_t)
+        if why:
+            raise ClockWentBack(why)
+    st["last_seen_day"] = today
+    prev_at = st.get("last_seen_at")
+    st["last_seen_at"] = max(float(prev_at), float(now_t)) if isinstance(prev_at, (int, float)) and not isinstance(prev_at, bool) else float(now_t)
     if st.get("day") != today:
         st["day"] = today
         st["orders_today"] = []
         st["equity_start_of_day"] = 0.0     # set once equity is known this run
     # The trailing-week record of fiat-funded buys (R6 / guards.WeeklyBudget).
-    cutoff = time.time() - 7 * 86400
+    cutoff = now_t - 7 * 86400
     # H1 (2026-11-12): ONLY A ROW THAT CAN BE READ AND IS OLD IS DROPPED. This
     # was `float(r.get("at", 0)) >= cutoff`, and NaN is not >= anything, so a
     # row whose time was NaN fell out of the week and its dollars with it. A
@@ -1156,7 +1179,19 @@ def run_once(cfg, plan_only=False):
         print("  trader has placed nothing today and bought nothing ever.")
         print("  Nothing was read from a venue, planned, sealed or sent.")
         return
-    st = roll_day(st)
+    try:
+        st = roll_day(st)
+    except ClockWentBack as e:
+        # H4: not a new day. Nothing is rolled, read, planned, sealed or saved.
+        LAST_REFUSAL = str(e)
+        hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
+        print("  " + LAST_REFUSAL)
+        print("  The day's order count was NOT reset and no approval was re-read.")
+        print("  If the record is wrong and the clock is right, last_seen_day and")
+        print("  last_seen_at in %s are the operator's to edit; this program only" % STATE)
+        print("  ever raises them.")
+        print("  Nothing was read from a venue, planned, sealed or sent.")
+        return
 
     hr(f"COVENANT TRADER   {time.strftime('%Y-%m-%d %H:%M')}"
        + ("   [ARMED]" if cfg.get("armed") else "   [disarmed]"))
@@ -1383,6 +1418,9 @@ def cmd_status(cfg):
         # H2: status still prints; it says the state is unknown and shows no
         # count as though it were known.
         state_note = "UNREADABLE (%s) -- no cycle will run until it is repaired" % e
+        st = {}
+    except ClockWentBack as e:
+        state_note = "NOT ROLLED -- %s" % e                                   # H4
         st = {}
     hr("STATUS")
     print(f"  armed              : {cfg.get('armed')}")
