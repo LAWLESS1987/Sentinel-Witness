@@ -397,6 +397,11 @@ def admitted(seal_result):
 def gather(cfg):
     """Balances per venue + live prices and 200d regime. Returns a portfolio."""
     per_venue, venue_notes = {}, []
+    # H3 (2026-11-12): a venue that HAS a credential and could not be read is
+    # named here. Its holdings are missing from the book exactly as an unpriced
+    # holding's value is, and plan() refuses on either. A venue with no
+    # credential is not one of these: this machine holds nothing it can see there.
+    venues_failed = []
     for v in V.all_venues():
         if not v.has_credentials():
             venue_notes.append(f"{v.name}: no credential installed")
@@ -405,6 +410,7 @@ def gather(cfg):
             per_venue[v.name] = v.balances()
         except V.VenueError as e:
             venue_notes.append(f"{v.name}: {e}")
+            venues_failed.append(v.name)
 
     # H1 (2026-11-12): A BALANCE THAT IS NOT A FINITE NUMBER AT OR ABOVE ZERO
     # is a venue that could not be read, not a holding of NaN units.
@@ -417,6 +423,7 @@ def gather(cfg):
                                "zero -- this venue is treated as unread"
                                % (vname, ", ".join(sorted(odd))))
             del per_venue[vname]
+            venues_failed.append(vname)
 
     merged = {}
     for vname, bal in per_venue.items():
@@ -455,7 +462,24 @@ def gather(cfg):
     total = sum(p["val"] for p in positions) + cash
     return {"positions": positions, "cash": cash, "total": total,
             "unpriced": unpriced, "venue_notes": venue_notes,
-            "venues_read": sorted(per_venue)}
+            "venues_read": sorted(per_venue), "venues_failed": sorted(venues_failed)}
+
+
+def book_incomplete(pf):
+    """Why this portfolio is not the whole book, as a list of phrases; [] when
+    it is. H3 (2026-11-12). Two ways a holding goes missing from `total`:
+    it could not be priced (the venues disagree, a fetch failed, the price was
+    not a number), or the venue holding it could not be read at all. Either
+    way every share of the book computed from `total` is too large."""
+    out = []
+    for u in pf.get("unpriced") or []:
+        if isinstance(u, dict):
+            out.append("%s has no price (%s)" % (u.get("sym"), u.get("why") or "no reason given"))
+        else:
+            out.append("%s has no price" % (u,))
+    for name in pf.get("venues_failed") or []:
+        out.append("venue %s could not be read" % name)
+    return out
 
 
 # --------------------------------------------------------------- rule engine
@@ -617,6 +641,18 @@ def plan(cfg, pf, week_spent=0.0):
     nothing. A buy path would be inventing an edge the data does not support.
     """
     orders, notes = [], []
+    # H3 (2026-11-12): AN INCOMPLETE BOOK PLANS NOTHING. gather() leaves a
+    # holding it could not price out of `total`, so every other holding's share
+    # of the book reads too high; a coin at 15% looked like 60%, the
+    # concentration cap wanted it trimmed, and a sale was planned because a
+    # price feed was down. The floors are not read and nothing is written
+    # either: this returns before reserve_baseline().
+    missing = book_incomplete(pf)
+    if missing:
+        return [], ["BOOK INCOMPLETE -- planning NO orders this cycle: %s. Every share "
+                    "of the portfolio would be computed against a total that leaves "
+                    "these out. The plan resumes on the first cycle that can read and "
+                    "price everything." % "; ".join(missing)]
     total, cap = pf["total"], cfg["max_position_pct"]
     if total <= 0:
         return orders, ["portfolio total is zero -- nothing to plan"]
@@ -1154,9 +1190,14 @@ def run_once(cfg, plan_only=False):
               f"cash {pf['cash']:,.2f} ({pf['cash']/pf['total']:.1%})")
 
     # equity history feeds the guards
+    # H3: an incomplete book is not the day's opening equity and not the
+    # starting book. The peak only ever rises, so an understated total cannot
+    # hurt it; the start-of-day figure and the once-only starting total are
+    # set only from a book that was read and priced whole.
+    book_whole = not book_incomplete(pf)
     if pf["total"]:
         st["equity_peak"] = max(st.get("equity_peak", 0.0), pf["total"])
-        if not st.get("equity_start_of_day"):
+        if not st.get("equity_start_of_day") and book_whole:
             st["equity_start_of_day"] = pf["total"]
 
     guard_blocks = []
@@ -1177,7 +1218,8 @@ def run_once(cfg, plan_only=False):
             # The ONLY place this is written, and only from a real portfolio
             # read -- see guards.set_starting_total for what went wrong when it
             # was two places.
-            starting_total_usd=_guards.set_starting_total(pf["total"], RESERVE_PATH),
+            starting_total_usd=(_guards.set_starting_total(pf["total"], RESERVE_PATH)
+                                if book_whole else _guards.starting_total(RESERVE_PATH)),
             bought_total_usd=st.get("bought_total_usd"),
             fiat_buys_week=list(st.get("fiat_buys", [])))
         for vd in _guards.GuardStack().evaluate(state):
