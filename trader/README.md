@@ -34,6 +34,67 @@ the caps are still set in this trader's own config. See
 [`docs/AUTO_TRADING_PLAN_2026-11-09.md`](docs/AUTO_TRADING_PLAN_2026-11-09.md) for what is
 still open before arming.
 
+## Hardening pass, 2026-11-12 (H1 to H11)
+
+An independent review of this folder listed eleven defects. Each was checked in the code,
+fixed, and given a suite that drives it both ways (`test_h01_*.py` to `test_h11_*.py`). Written
+by an AI (Claude). Nothing below was run against an exchange: every venue in those suites is
+a fake or has its transport stubbed, and no live cycle has run on this code. **The sections
+further down this file are kept as they were written; where one of them is no longer true,
+this section says so.**
+
+| | What was wrong | What happens now |
+|---|---|---|
+| H1 | NaN fails every comparison, so an order of NaN dollars cleared both caps; a NaN or negative row in the day's record made the day never full | an amount is a finite number above zero, in an order and in the record; anything else refuses, and a bad row blocks rather than being skipped |
+| H2 | a state file that could not be read came back as "never run" (0 orders today, $0 ever bought) and was then overwritten | the cycle refuses with the reason, the file is left exactly as it is, and a copy is kept beside it (`trader_state.json.unreadable-<hash>`). Exit code 4 |
+| H3 | a holding with no price was left out of the total, the rest looked over-concentrated, and a sale was planned | a cycle that cannot price or read the whole book plans no orders, and names what is missing |
+| H4 | the day rolled over whenever the stored date differed, so a clock set back reset the day's count and revived an old approval | the state keeps the latest day and moment seen; an earlier clock refuses the cycle. Exit code 4 |
+| H5 | a config that left `seal_required` or `min_sealed_signals` out had neither; caps were whatever the config said | missing keys take the shipped values; **hard ceilings in `guards.py`: $25 an order, $50 a day, 2 orders a day**, which a config may only lower. A cap above one refuses, it is not clamped |
+| H6 | `rule5_waiver`, `trading_scope.open_reserve_pct` and `covenant_home` / `SENTINEL_COVENANT_HOME` could remove Rule 5, remove the reserve, and choose the witness | disarmed they still work and the cycle prints **REHEARSAL ONLY**. Armed, each refuses the cycle; the witness folder must be **pinned** (below) |
+| H7 | arming was one key press and never ended | `armed: true` counts only with `armed_until`, an ISO time with its zone, at most 24 hours ahead. `SENTINEL_ARM_AND_RUN.bat` shows what arming means, requires the typed phrase `ARM REAL ORDERS`, and arms for 12 hours |
+| H8 | the approval was a yes or no for the day; the orders placed were whatever was planned at run time | each order must be one the approved plan proposed (same symbol and side, no larger, at most 2% smaller); a decline anywhere in the day is final; an approval lasts 12 hours |
+| H9 | nothing checked what the exchange key may do, or who else can read it | before a live order the venue is asked; a key that can withdraw or transfer places nothing. A credential file another account can read is not used (Windows: the file's ACL) |
+| H10 | a Kraken rejection was booked as "maybe placed" and used one of the day's orders; a resting order was never looked at again; Kraken and Robinhood sent market orders | definite refusals free the day's row; open orders are read and nothing is planned for a symbol that has one; a sale counts as proceeds only once the venue confirms a fill; orders are limits within 1% of the plan's price |
+| H11 | a halt file that could not be looked at read as "no halt" | it is treated as a halt; "not there" is only ever the operating system saying so |
+
+### What an operator will notice
+
+- **An armed cycle now refuses if the config carries the Rule 5 waiver, a `trading_scope`
+  reserve under 50%, `daily_plan_required: false`, `min_sealed_signals` under 30, or
+  `rule5_require_significance: false`.** This reverses, for armed runs only, the operator's
+  recorded choices of 2026-10-05 (the waiver) and 2026-10-06 (the scope). Neither record is
+  deleted and both still work disarmed. With the waiver gone Rule 5 applies, and on the record
+  this file quotes (7 of 30 settled) it refuses every live order. Undoing this is an edit to
+  `guards.live_terms_reasons`, in the open.
+- **An armed cycle needs the witness folder pinned.** Write covenant's absolute path as the one
+  line of `%USERPROFILE%\.sentinel_witness\covenant_home.pin` (a folder this trader never
+  writes to), and keep `covenant_home` in `trader_config.json` naming the same folder.
+- **An armed cycle needs covenant to say what was approved.** `witness.approval_record` calls
+  `covenant_daily_plan.approval_record(now)` in covenant; the contract is in that function's
+  docstring. Whether covenant has it is UNDETERMINED from this repository. Until it does,
+  every live order is refused with "approval binding unavailable".
+- **Live Robinhood orders need a hand-written record** of what the key may do, in
+  `%USERPROFILE%\.sentinel_witness\key_scope.json` (shape in `key_scope.recorded`). Coinbase
+  and Kraken are asked directly.
+- A config with a cap above $25 / $50 / 2 refuses every cycle, armed or not.
+- `covenant_trader.py` can exit 4 (the cycle was refused before it began: unreadable state, or
+  a clock behind the record).
+
+### What this pass did not do
+
+- It did not run against a venue. The endpoints and field names are from the venues' public
+  documentation as read on 2026-11-12, not from an observed answer.
+- The pin file, the key-scope record and the state file all belong to the same OS user. This
+  closes one-line roads (an environment variable, a config edit); it does not defend against
+  whoever controls the account.
+- The armed terms are checked for the cycle (`witness_ready`) and for a config
+  `guards.preconditions` reads from disk. A Python caller that hands `preconditions()` its own
+  dict is held to the waiver refusal, the caps, the arming and the clock, and not to the rest.
+- Robinhood fills are not read, so no sale there is ever confirmed. A row whose venue answer
+  was lost has no order id and stays UNKNOWN for a person to resolve.
+- `plan()` still counts a sale planned in the same cycle as cash on hand for R6.
+- covenant's older executor is still armed beside this one (the plan of 2026-11-09, item 2).
+
 ## Venues
 
 `venues.py` holds three order adapters: **Coinbase**, **Kraken** and **Robinhood**. A
@@ -187,6 +248,17 @@ python test_f5_reserve.py                the 50% reserve and the frozen hold-onl
 python test_f7_caps.py                   the per-order and per-day caps
 python test_v2_venue_guarantee.py        each venue's dry run is what the documents say
 python test_rule5_ledger.py              the Rule 5 ledger
+python test_h01_amounts.py               H1: NaN, infinite, zero and negative amounts, in orders and in the record
+python test_h02_state.py                 H2: an unreadable state stops the cycle and is never overwritten
+python test_h03_unpriced.py              H3: no orders on a book that cannot be priced or read whole
+python test_h04_clock.py                 H4: the day rolls forward only
+python test_h05_config.py                H5: shipped defaults, and the $25 / $50 / 2 ceilings
+python test_h06_waivers_witness.py       H6: armed, no waiver, no reserve under 50%, a pinned witness folder
+python test_h07_arming.py                H7: armed_until, and the arming file's typed phrase
+python test_h08_approval.py              H8: the approval binds the orders, expires, a decline is final
+python test_h09_venue_keys.py            H9: what the key may do; who else can read the credential
+python test_h10_order_mechanics.py       H10: definite refusals, open orders, confirmed fills, the price band
+python test_h11_fail_closed.py           H11: a halt that cannot be looked at is a halt
 ```
 
 The rest are `test_a92_topic_is_a_credential.py`, `test_d3_daily_guards.py`,
