@@ -272,6 +272,28 @@ print(json.dumps(D.gate_reasons(now=req.get("now"))))
 """
 
 
+# H8 (2026-11-12): WHAT WAS APPROVED, not only whether something was.
+# _GATE_SCRIPT above answers yes or no for the day. This asks covenant for the
+# record behind that answer -- the day, the plan's hash, every decision row for
+# the day and the plan's proposed orders -- so that guards.approval_reasons can
+# hold each order to it. The function it calls, covenant_daily_plan.
+# approval_record(now), is COVENANT'S to provide; where covenant does not have
+# it the answer is ok=false with that reason, and no order can be bound to an
+# approval, so none goes live. The contract is in approval_record() below.
+_APPROVAL_SCRIPT = r"""
+import json, sys
+sys.path.insert(0, ".")
+req = json.loads(sys.stdin.read())
+import covenant_daily_plan as D
+fn = getattr(D, "approval_record", None)
+if fn is None:
+    print(json.dumps({"ok": False, "why": "covenant_daily_plan has no approval_record(now): "
+                      "covenant says WHETHER today is approved but not WHAT was approved"}))
+else:
+    print(json.dumps(fn(now=req.get("now"))))
+"""
+
+
 def _child_env():
     """This process's environment without the variables that tell a Python
     interpreter WHAT CODE TO LOAD (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME,
@@ -372,6 +394,43 @@ def daily_plan_gate_reasons(now=None, cfg=None, runner=None):
     if not isinstance(out, list) or not all(isinstance(x, str) for x in out):
         return ["daily plan gate unavailable (answer was not a list of "
                 "reasons) -- nothing may go live"]
+    return out
+
+
+def approval_record(now=None, cfg=None, runner=None):
+    """Covenant's record of today's approval, as a dict. ok=false on any
+    failure to get one, with `why`. H8.
+
+    THE CONTRACT covenant_daily_plan.approval_record(now) must meet (now is
+    epoch seconds or null, read with time.localtime as gate_reasons reads it):
+
+        {"ok": true,
+         "date": "YYYY-MM-DD",              the local day the record is for
+         "plan_hash": "<hash of that day's plan>",
+         "decisions": [                     EVERY decision row for that day,
+           {"decision": "approve" | "decline",      oldest first
+            "at": <epoch seconds>,
+            "plan_hash": "<the hash the row was signed over>"}, ...],
+         "orders": [                        the plan's PROPOSED orders
+           {"sym": "XLM", "side": "sell" | "buy", "usd": 25.0}, ...]}
+
+    Covenant reports; it does not decide here. Whether a decline is final, how
+    long an approval lasts and how close an order must be to a proposed one
+    are guards.approval_reasons' to say, in this repository, where they are
+    tested. Armed, the folder asked is the pinned one or nothing (H6)."""
+    pin_why = home_reasons(cfg)
+    if pin_why:
+        return {"ok": False, "why": "; ".join(pin_why)}
+    home = effective_home(cfg)
+    if not home:
+        return {"ok": False, "why": "covenant_home not configured"}
+    if now is not None and (isinstance(now, bool) or not isinstance(now, (int, float))):
+        return {"ok": False, "why": "now must be epoch seconds, got %s" % type(now).__name__}
+    ok, out, why = (runner or _run)(home, _APPROVAL_SCRIPT, {"now": now}, GATE_TIMEOUT_S)
+    if not ok:
+        return {"ok": False, "why": why}
+    if not isinstance(out, dict) or not isinstance(out.get("ok"), bool):
+        return {"ok": False, "why": "covenant's answer was not an approval record"}
     return out
 
 

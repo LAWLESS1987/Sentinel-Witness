@@ -1679,6 +1679,137 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     return bad + _caller_reasons(caller, order, guard_blocks)
 
 
+# ---- H8 (2026-11-12): THE APPROVAL BINDS THE ORDERS ---------------------------
+#
+# The daily plan gate above asks covenant one question: is today's plan
+# approved? On yes, covenant_trader.execute placed whatever plan() computed at
+# run time. Nothing compared the two. The operator approved a plan at 07:10
+# and the orders placed at 09:00 were the planner's of 09:00 -- usually the
+# same, never checked, and after a price move or a config edit, not the same.
+#
+# approval_reasons() holds ONE order to covenant's record of what was approved
+# (witness.approval_record). The rules are here, not in covenant, so that they
+# are in the repository that places the order and is tested for it:
+#
+#   * A DECLINE ANYWHERE IN THE DAY'S RECORD IS FINAL FOR THAT DAY. An approve
+#     row after it does not undo it.
+#   * AN APPROVAL LASTS APPROVAL_VALID_S (12 hours) from the moment it was
+#     given, and then it has expired. No document in this folder states a
+#     validity; the operator approves between about 07:00 and 11:20
+#     (test_g4_money_gates.py), and 12 hours keeps an order inside the day it
+#     was approved for.
+#   * THE ORDER MUST BE ONE OF THE PLAN'S PROPOSED ORDERS: the same symbol,
+#     the same side, and a size no larger than the proposed one and no more
+#     than APPROVAL_SIZE_TOLERANCE (2%) under it. A plan with no orders
+#     approves no orders.
+#   * EACH PROPOSED ORDER IS GOOD FOR ONE PLACEMENT. Orders already in today's
+#     record use up the proposed orders they match, so the same approved order
+#     cannot go out in two cycles on one day.
+APPROVAL_VALID_S = 12 * 3600.0
+APPROVAL_SIZE_TOLERANCE = 0.02
+APPROVAL_FUTURE_SLACK_S = 300.0
+APPROVAL_UNAVAILABLE = "approval binding unavailable"
+APPROVAL_DECLINED = "today's plan was DECLINED"
+
+
+def _approved_orders(approval):
+    """The record's proposed orders as [(SYM, side, usd)], or None if any is
+    not a symbol, a side and a finite amount above zero."""
+    rows = approval.get("orders")
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        sym, side, usd = r.get("sym"), r.get("side"), finite_positive(r.get("usd"))
+        if not isinstance(sym, str) or not sym.strip() or side not in ("buy", "sell") or usd is None:
+            return None
+        out.append((sym.strip().upper(), side, usd))
+    return out
+
+
+def _size_fits(usd, proposed):
+    """Never larger than proposed; at most the tolerance under it."""
+    return proposed * (1.0 - APPROVAL_SIZE_TOLERANCE) - 1e-9 <= usd <= proposed + 1e-9
+
+
+def approval_reasons(order, approval, orders_today=None, now=None):
+    """Why THIS order is not covered by today's approval. [] means it is."""
+    t = time.time() if now is None else now
+    if not isinstance(approval, dict) or approval.get("ok") is not True:
+        why = approval.get("why") if isinstance(approval, dict) else "no record"
+        return ["%s (%s) -- no order can be matched to an approval, so none goes live"
+                % (APPROVAL_UNAVAILABLE, str(why)[:200])]
+    if finite_number(t) is None:
+        return ["%s (the time now is not a finite number)" % APPROVAL_UNAVAILABLE]
+    today = local_day(t)
+    if approval.get("date") != today:
+        return ["%s (the record is for %r and today is %s)"
+                % (APPROVAL_UNAVAILABLE, approval.get("date"), today)]
+    plan_hash = approval.get("plan_hash")
+    decisions = approval.get("decisions")
+    if not isinstance(plan_hash, str) or not plan_hash.strip() or not isinstance(decisions, list):
+        return ["%s (the record carries no plan hash or no list of decisions)" % APPROVAL_UNAVAILABLE]
+    approved_at = []
+    for d in decisions:
+        if not isinstance(d, dict) or d.get("decision") not in ("approve", "decline"):
+            return ["%s (a decision row in the day's record cannot be read)" % APPROVAL_UNAVAILABLE]
+        if d["decision"] == "decline":
+            # FINAL. Whatever else the day's record holds, before or after.
+            return ["%s (%s) -- a decline is final for the day, whatever was approved "
+                    "before or after it" % (APPROVAL_DECLINED, today)]
+        at = finite_number(d.get("at"))
+        if at is None:
+            return ["%s (an approval in the day's record has no readable time)" % APPROVAL_UNAVAILABLE]
+        if d.get("plan_hash") == plan_hash:
+            approved_at.append(at)
+    if not approved_at:
+        return ["no approval on record for today's plan (hash %s...)" % plan_hash[:12]]
+    at = max(approved_at)
+    if at > t + APPROVAL_FUTURE_SLACK_S:
+        return ["%s (the approval is dated %d s in the future)" % (APPROVAL_UNAVAILABLE, int(at - t))]
+    if t - at > APPROVAL_VALID_S:
+        return ["today's approval has EXPIRED: it was given %.1f hours ago and lasts %d -- "
+                "approve the plan again" % ((t - at) / 3600.0, APPROVAL_VALID_S // 3600)]
+    proposed = _approved_orders(approval)
+    if proposed is None:
+        return ["%s (a proposed order in the approved plan cannot be read)" % APPROVAL_UNAVAILABLE]
+    sym = str(order.get("sym") or "").strip().upper()
+    side, usd = order.get("side"), finite_positive(order.get("usd"))
+    if not sym or side not in ("buy", "sell") or usd is None:
+        return ["the order is not one an approval can be matched to (symbol, side, amount)"]
+    if not proposed:
+        return ["the approved plan proposes NO orders, so it approves none -- %s %s $%.2f is not in it"
+                % (side, sym, usd)]
+    # What today's record has already used up.
+    free = list(proposed)
+    for row in orders_today or []:
+        if not isinstance(row, dict):
+            continue
+        r_sym = str(row.get("sym") or "").strip().upper()
+        r_usd = finite_positive(row.get("usd"))
+        if r_usd is None:
+            continue
+        for i, (p_sym, p_side, p_usd) in enumerate(free):
+            if p_sym == r_sym and p_side == row.get("side") and _size_fits(r_usd, p_usd):
+                del free[i]
+                break
+    same = [p for p in proposed if p[0] == sym and p[1] == side]
+    if not same:
+        return ["%s %s is not in the approved plan (it proposes: %s)"
+                % (side, sym, ", ".join("%s %s $%.2f" % (p[1], p[0], p[2]) for p in proposed))]
+    if any(_size_fits(usd, p[2]) for p in free if p[0] == sym and p[1] == side):
+        return []
+    if any(_size_fits(usd, p[2]) for p in same):
+        return ["%s %s $%.2f is in the approved plan, and today's record shows it already "
+                "placed -- one approved order is one placement" % (side, sym, usd)]
+    return ["%s %s $%.2f does not match the approved size (%s): an order may be no larger "
+            "than the one approved and at most %.0f%% under it"
+            % (side, sym, usd, ", ".join("$%.2f" % p[2] for p in same),
+               APPROVAL_SIZE_TOLERANCE * 100)]
+
+
 # ---- WHICH REASONS ARE A DECISION, AND WHICH ARE THE ABSENCE OF ONE --------
 #
 # Added 2026-09-18 for the Sentinel-Witness specification's A1-A3. Some reasons

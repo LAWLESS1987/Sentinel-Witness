@@ -1004,7 +1004,7 @@ def venue_for(order, live_venues):
 
 
 def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
-            may_buy=None):
+            may_buy=None, approval=None):
     """`may_buy` -- optional callable sym -> [blocking guard names]. A83.
 
     THE GUARD STACK WAS ASKED WITHOUT A SYMBOL, so the asset-specific guards
@@ -1022,6 +1022,9 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     enforces -- a rule about what may be sold has no view on what may be
     bought, and a guard never stops a sale.
     """
+    # H8 (2026-11-12): `approval` -- covenant's record of what was approved
+    # today (witness.approval_record). Asked for once, and only when an order
+    # has cleared everything else and is about to go live; a test hands one in.
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
@@ -1043,6 +1046,20 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
                 extra = ["per-symbol guards unavailable (%s)" % type(e).__name__]
         bad = preconditions(cfg, st, {}, o, sealed_ok,
                             list(guard_blocks) + extra if extra else guard_blocks)
+        # H8: THE APPROVAL BINDS THE ORDER. The gate inside preconditions
+        # asked whether today is approved; this asks whether THIS order is one
+        # the approved plan proposed. Only where the plan gate is on -- and an
+        # armed cycle cannot have it off (H6). Never when plan_only.
+        if not bad and not plan_only and cfg.get("daily_plan_required", True):
+            if _guards is None:
+                bad = ["guards.py unavailable -- the order cannot be matched to an approval"]
+            else:
+                if approval is None:
+                    try:
+                        approval = witness.approval_record(cfg=cfg)
+                    except Exception as e:                        # noqa: BLE001
+                        approval = {"ok": False, "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
+                bad = list(_guards.approval_reasons(o, approval, st.get("orders_today")))
         v = venue_for(o, live_venues)
         if v is None:
             results.append({**o, "status": "NO VENUE",
