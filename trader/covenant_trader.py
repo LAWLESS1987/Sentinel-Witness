@@ -130,8 +130,26 @@ DEFAULT_CONFIG = {
 
 
 # ------------------------------------------------------------------- plumbing
+def _absent(path):
+    """True only when the OS says `path` is not there (FileNotFoundError).
+    H11 (2026-11-12): os.path.exists answers False for a path it could not
+    examine, and in three places here False was the answer that carried on --
+    "no config yet, write the default one", "no state yet, start from zero",
+    "no floors yet, set them at today's quantities". guards.path_state is the
+    one reading; without guards the same test is made here."""
+    if _guards is not None:
+        return _guards.path_state(path) == "absent"
+    try:
+        os.lstat(path)
+        return False
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def load_config():
-    if not os.path.exists(CONFIG):
+    if _absent(CONFIG):          # H11: was `not os.path.exists(CONFIG)`
         json.dump(DEFAULT_CONFIG, open(CONFIG, "w", encoding="utf-8"), indent=2)
         print(f"wrote a disarmed default config to {os.path.basename(CONFIG)}")
     cfg = dict(DEFAULT_CONFIG)
@@ -191,7 +209,7 @@ def _state_problem(st):
 def _read_state_file(path):
     """The state at `path`, or None when there is no file. Raises
     StateUnreadable for a file that is there and cannot be used."""
-    if not os.path.lexists(path):
+    if _absent(path):            # H11: was `not os.path.lexists(path)`
         return None
     try:
         with open(path, "rb") as fh:
@@ -649,7 +667,7 @@ def reserve_baseline(pf, path=RESERVE_PATH):
     # means "no floors have been set yet"; a file that exists and will not
     # parse means the floors are UNKNOWN, and the one thing that must not
     # happen is to carry on from an empty baseline. See ReserveUnreadable.
-    if os.path.exists(path):
+    if not _absent(path):        # H11: was `os.path.exists(path)`
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -1696,7 +1714,8 @@ def cmd_status(cfg):
         _ok, _why = _guards.arming(cfg)
         print(f"  armed until        : {cfg.get('armed_until')!r}")
         print(f"  in effect          : {'ARMED -- ' + _why if _ok else _why}")
-    print(f"  halt file present  : {os.path.exists(HALT)}  ({os.path.basename(HALT)})")
+    _hs = _guards.path_state(HALT) if _guards is not None else ("present" if os.path.exists(HALT) else "absent")
+    print(f"  halt file present  : {'no' if _hs == 'absent' else 'YES' if _hs == 'present' else 'COULD NOT BE CHECKED (' + _hs + ') -- treated as a halt'}  ({os.path.basename(HALT)})")
     print(f"  max order          : ${cfg['max_order_usd']:,.0f}")
     print(f"  daily notional cap : ${cfg['max_daily_notional_usd']:,.0f}")
     print(f"  orders per day     : {cfg['max_orders_per_day']}")

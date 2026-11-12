@@ -75,6 +75,42 @@ BAD_AMOUNT = "order amount is not a finite number above zero"
 BAD_SIDE = "order side is not exactly 'buy' or 'sell'"
 
 
+# ---- H11 (2026-11-12): "NOT THERE" IS ONLY EVER FileNotFoundError --------------
+# os.path.exists() answers False for a path it could not examine at all -- a
+# permission error, a drive that has gone away, a name the OS will not parse.
+# Two kinds of switch in this folder were built on it, and for both a False
+# was the PERMISSIVE answer:
+#
+#   * the halt:  `if os.path.exists(HALT)` -- a TRADER_HALT that could not be
+#     looked at read as "no halt", and orders went on;
+#   * "never run": `if not os.path.exists(state): return []` -- a state file
+#     that could not be looked at read as a trader that had never placed an
+#     order, so the day's count and the lifetime buy total were a known zero.
+#
+# path_state() is the one reading. "absent" is said only when the OS itself
+# says the name is not there; anything else that is not "present" is
+# "unknown: <why>", and every caller treats unknown as the refusing answer:
+# halted, or a state that exists and cannot be read.
+_lstat = os.lstat          # a test replaces this to make a path un-examinable
+
+
+def path_state(p):
+    """'present', 'absent', or 'unknown: <why>' for the path `p`. lstat, so a
+    directory entry of any kind named TRADER_HALT is a halt."""
+    try:
+        _lstat(p)
+        return "present"
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, ValueError, TypeError) as e:
+        return "unknown: %s" % type(e).__name__
+
+
+def _absent(p):
+    """True only when the OS says `p` is not there. Unknown is not absent."""
+    return path_state(p) == "absent"
+
+
 # ---- H4 (2026-11-12): THE CLOCK ONLY GOES FORWARD ----------------------------
 # The day rolled over whenever the stored date merely DIFFERED from today's.
 # Set the clock back a day, or cross a time zone westward near midnight, and
@@ -822,7 +858,7 @@ def fiat_buys_week_now(path: Optional[str] = None, now: Optional[float] = None):
     Same contract as orders_today_now: a missing file is a KNOWN empty week
     (the trader has never run), a file that will not parse is unknown."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11: only a path the OS says is not there
         return []
     try:
         with open(p, encoding="utf-8") as fh:
@@ -840,7 +876,7 @@ def orders_today_now(path: Optional[str] = None, now: Optional[float] = None):
     order until the caps have already been used once. A file that exists but
     will not parse IS unknown, and that blocks."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return []
     try:
         with open(p, encoding="utf-8") as fh:
@@ -871,7 +907,7 @@ def bought_total_now(path: Optional[str] = None) -> Optional[float]:
     by a build that did not keep the total, and guessing zero for it would hand
     back a whole budget that may already have been spent."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return 0.0
     try:
         with open(p, encoding="utf-8") as fh:
@@ -1143,7 +1179,7 @@ def set_starting_total(total: float, path: Optional[str] = None) -> Optional[flo
     # BuyBudget.check refuse with its existing "no starting book value
     # recorded" verdict, which is the fail-closed direction.
     p = path or RESERVE_PATH
-    if os.path.exists(p):
+    if not _absent(p):           # H11: present, or could not be examined
         try:
             with open(p, encoding="utf-8") as fh:
                 if not isinstance(json.load(fh), dict):
@@ -1499,7 +1535,7 @@ def load_trader_state(path: Optional[str] = None):
     this the first time it runs, and treating "never run" as unknown would
     block every order until one had already been placed."""
     p = path or TRADER_STATE
-    if not os.path.exists(p):
+    if _absent(p):               # H11
         return {}
     try:
         with open(p, encoding="utf-8") as fh:
@@ -1585,13 +1621,28 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     _clock = clock_back(st, now)
     if _clock:
         bad.append(_clock)
-    if os.path.exists(HALT):
+    # H11 (2026-11-12): A HALT THAT CANNOT BE LOOKED AT IS A HALT. These were
+    # os.path.exists(), which answers False for a path it could not examine.
+    _halt = path_state(HALT)
+    if _halt == "present":
         bad.append("TRADER_HALT file present")
+    elif _halt != "absent":
+        bad.append("TRADER_HALT could not be checked (%s) -- treated as a halt" % _halt)
     # A halt dropped in covenant stops this trader too: whoever reaches for
     # TRADER_HALT should not have to remember which folder trades now.
-    _cov_halt = witness.halt_path(cfg)
-    if _cov_halt and os.path.exists(_cov_halt):
-        bad.append("TRADER_HALT file present in covenant")
+    try:
+        _cov_halt = witness.halt_path(cfg)
+    except Exception as e:                                       # noqa: BLE001
+        _cov_halt = None
+        bad.append("TRADER_HALT in covenant could not be checked (%s) -- treated as a halt"
+                   % type(e).__name__)
+    if _cov_halt:
+        _halt = path_state(_cov_halt)
+        if _halt == "present":
+            bad.append("TRADER_HALT file present in covenant")
+        elif _halt != "absent":
+            bad.append("TRADER_HALT in covenant could not be checked (%s) -- treated as a halt"
+                       % _halt)
     # 7. THE DAY'S PLAN IS APPROVED (2026-09-12, the operator's decision: "i'll
     # have to daily approve of the strategy it lays out"). No order goes live
     # without a signed approve for TODAY's plan, matching its hash --

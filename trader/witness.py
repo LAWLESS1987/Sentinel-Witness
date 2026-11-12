@@ -188,7 +188,10 @@ def reserve_path(cfg=None):
 def halt_path(cfg=None):
     """Covenant's TRADER_HALT. A halt dropped in either folder stops this
     trader; one folder's halt never needs to be remembered in the other."""
-    home = covenant_home(cfg)
+    # H11: armed, the folder is the pinned one (H6) even when the config names
+    # none; a folder the config or the environment names is still looked in,
+    # because one more place a halt is honoured costs nothing.
+    home = effective_home(cfg) or covenant_home(cfg)
     return os.path.join(home, "TRADER_HALT") if home else None
 
 
