@@ -142,61 +142,41 @@ for label, over, needle in (("no armed_until", {"armed_until": None}, "missing")
 
 
 # ---- C: execute() -------------------------------------------------------------------
-class FakeVenue:
-    name = "fake"
+# R1 (2026-11-12): an order goes live only through guards.live_gate, which
+# judges the config and state on DISK, the witness and the venue. The dict
+# fixture this section used -- armed, with the other gates switched off --
+# can no longer go live at all, so it now runs on gated_fixture.Gated: every
+# gate satisfied, on disk, with a stand-in covenant, and then the ONE thing
+# this section is about is varied.
+from gated_fixture import Gated, Venue, order as gated_order   # noqa: E402
 
-    def __init__(self):
-        self.calls = []
-
-    def has_credentials(self):
-        return True
-
-    # Later items of this pass ask a venue more before a live order (what its
-    # key may do, what is open). A stand-in answers them the way a clean,
-    # trade-only venue would, so this file keeps driving the ARMING alone.
-    def key_permissions(self):
-        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "fake"}
-
-    def open_orders_norm(self):
-        return []
-
-    def recent_fills(self, since=None):
-        return []
-
-    def reference_price(self, sym):
-        return 1.0
-
-    def place(self, sym, side, qty, live=False, **kw):
-        self.calls.append((sym, side, qty, live))
-        return {"descr": "fake", "txid": "TX1" if live else None}
+O7 = gated_order("XLM", "sell", 20.0)
 
 
-def run_execute(c):
-    fv = FakeVenue()
-    keep_all, keep_state, keep_save = T.V.all_venues, T.STATE, T.save_state
-    st = {"day": TODAY, "orders_today": []}
-    try:
-        T.V.all_venues = lambda: [fv]
-        T.STATE = os.path.join(tempfile.mkdtemp(), "trader_state.json")
-        T.save_state = lambda s: None
-        res = T.execute(c, st, [{"sym": "XLM", "side": "sell", "qty": 20.0, "usd": 20.0,
-                                 "rule": "test", "px": 1.0, "at": {"fake": 100.0}}], True, [])
-    finally:
-        T.V.all_venues, T.STATE, T.save_state = keep_all, keep_state, keep_save
-    return res, fv, st
+def run_execute(**arming_on_disk):
+    """One $20 sale through execute(), every gate satisfied, with the ARMING in
+    the config on disk as given. Returns (results, the venue, today's rows)."""
+    with Gated(approved=[O7], cfg=arming_on_disk) as fx:
+        fv = Venue()
+        res = fx.execute([dict(O7)], [fv])
+        return res, fv, fx.state_on_disk()["orders_today"]
 
 
-res, fv, st = run_execute(cfg())
+res, fv, rows = run_execute()
 check("C1 on a complete arming the order goes LIVE and is booked in the day's record",
-      [c[3] for c in fv.calls] == [True] and res[0]["status"] == "PLACED" and len(st["orders_today"]) == 1,
-      (fv.calls, res[0].get("status"), res[0].get("blocked_by")))
-res, fv, st = run_execute(cfg(armed_until=iso(time.time() - 60)))
+      fv.live() == [True] and res[0]["status"] == "PLACED" and len(rows) == 1,
+      (fv.live(), res[0].get("status"), res[0].get("blocked_by")))
+res, fv, rows = run_execute(armed_until=iso(time.time() - 60))
 check("C2 on an EXPIRED arming the same order goes to the venue's DRY RUN and nothing is booked",
-      [c[3] for c in fv.calls] == [False] and res[0]["status"] == "VALIDATED" and st["orders_today"] == []
-      and any("expired" in b for b in res[0]["blocked_by"]), (fv.calls, res))
-res, fv, st = run_execute(cfg(armed_until=None))
+      fv.live() == [False] and res[0]["status"] == "VALIDATED" and rows == []
+      and any("expired" in b for b in res[0]["blocked_by"]), (fv.live(), res))
+res, fv, rows = run_execute(armed_until=None)
 check("C3 ...and with no armed_until at all, the same",
-      [c[3] for c in fv.calls] == [False] and st["orders_today"] == [], (fv.calls, res))
+      fv.live() == [False] and rows == [], (fv.live(), res))
+res, fv, rows = run_execute(armed_until=iso(time.time() + 48 * H))
+check("C4 ...and with one two days ahead, the same",
+      fv.live() == [False] and rows == [] and any("at most 24" in b for b in res[0]["blocked_by"]),
+      (fv.live(), res))
 
 
 # ---- D: the cycle ---------------------------------------------------------------------

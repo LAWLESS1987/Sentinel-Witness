@@ -142,7 +142,9 @@ def kraken_reply(errors):
     keep = V._http
     try:
         V._http = lambda req, timeout=30: {"error": list(errors), "result": {}}
-        k._private("AddOrder", {"pair": "XXLMZUSD"})
+        # validate=true: since R1 a booking AddOrder is sent only from inside
+        # place(); the reply's classification is the same for either.
+        k._private("AddOrder", {"pair": "XXLMZUSD", "validate": "true"})
         return "no error"
     except Refused:
         return "refused"
@@ -161,7 +163,9 @@ check("E4 a reply that mixes the two is ambiguous: every entry must be a rejecti
 
 def _try(venue, qty, **kw):
     try:
-        return venue.place("XLM", "sell", qty, live=True, **kw)
+        # a dry run: the size checks come before anything is sent either way,
+        # and since R1 a live call is refused first for having no permit
+        return venue.place("XLM", "sell", qty, live=False, **kw)
     except Exception as e:                                       # noqa: BLE001
         return e
 
@@ -173,42 +177,24 @@ check("E5 a size that rounds to zero, or under the pair's minimum, is VenueRefus
 
 
 # ---- execute(): what a refusal does to the day's record ----------------------------------
-UNTIL = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
-CFG = {"armed": True, "armed_until": UNTIL, "daily_plan_required": False, "seal_required": True,
-       "min_sealed_signals": 0, "rule5_require_significance": False, "min_order_usd": 5.0,
-       "max_order_usd": 25.0, "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}
+# R1 (2026-11-12): an order goes live only through guards.live_gate, which
+# judges the config and state on DISK, the witness and the venue. The dict
+# fixture this file used -- armed, with the other gates switched off -- can no
+# longer go live at all, so execute() is driven on gated_fixture.Gated: every
+# gate satisfied, and the VENUE's behaviour is what varies.
+from gated_fixture import Gated, Venue   # noqa: E402
 
 
-class Fake:
-    name = "fake"
-
-    def __init__(self, behaviour=None):
-        self.calls, self.b = [], behaviour
-
-    def has_credentials(self):
-        return True
-
-    def key_permissions(self, fetch=None):
-        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "fake"}
-
-    def place(self, sym, side, qty, live=False, ref_px=None, client_ref=None):
-        self.calls.append({"sym": sym, "live": live, "ref_px": ref_px, "client_ref": client_ref})
-        if isinstance(self.b, Exception):
-            raise self.b
-        return {"descr": "fake", "txid": "TX-%d" % len(self.calls) if live else None}
+def Fake(behaviour=None):
+    return Venue("fake", behaviour=behaviour)
 
 
-def run_execute(venue, orders, st=None):
-    keep = (T.V.all_venues, T.STATE, T.save_state)
-    st = st if st is not None else {"day": TODAY, "orders_today": []}
-    try:
-        T.V.all_venues = lambda: [venue]
-        T.STATE = os.path.join(tempfile.mkdtemp(), "trader_state.json")
-        T.save_state = lambda s: None
-        res = T.execute(CFG, st, orders, True, [])
-    finally:
-        T.V.all_venues, T.STATE, T.save_state = keep
-    return res, st
+def run_execute(venue, orders):
+    """execute() with every gate satisfied and the plan proposing exactly these
+    orders. Returns (results, {"orders_today": today's rows on disk})."""
+    with Gated(approved=orders) as fx:
+        res = fx.execute([dict(o) for o in orders], [venue])
+        return res, {"orders_today": fx.state_on_disk()["orders_today"]}
 
 
 def order(sym="XLM", usd=20.0, px=2.0, side="sell"):
@@ -231,8 +217,14 @@ check("E9 ...and any other 4xx still frees it, as before", st["orders_today"] ==
 # ---- B: the band -----------------------------------------------------------------------------
 BAND = getattr(V, "PRICE_BAND", None)
 check("B0 the band is 1% of the reference price", BAND == 0.01, BAND)
+def permit(venue, sym, side, usd):
+    """A permit as guards.live_gate records one, for driving a real adapter's
+    live path over a stubbed transport. (The gate itself is test_r01's.)"""
+    return G._issue_permit(venue, sym, side, usd)
+
+
 k = Kraken()
-k.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a)
+k.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("kraken", "XLM", "sell", 20.0))
 ep, d = k.sent[-1]
 check("B1 Kraken, with a reference price: a LIMIT, immediate-or-cancel, at the band's edge "
       "($1.98 for a sale against $2.00) -- not a market order",
@@ -267,25 +259,26 @@ class Coinbase(V.CoinbaseVenue):
 
 
 c = Coinbase(1.9990, 2.0010)
-r = c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a)
+r = c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
 check("B2 Coinbase, touch inside the band: the post-only limit is sent, with the caller's "
       "reference as client_order_id", len(c.sent) == 1 and c.sent[0][1]["client_order_id"] == a
       and "limit_limit_gtd" in c.sent[0][1]["order_configuration"], c.sent)
 c = Coinbase(1.90, 1.91)                              # the market has dropped 4.5% since the plan was priced
 got = None
 try:
-    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a)
+    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("coinbase", "XLM", "sell", 20.0))
 except Exception as e:                                           # noqa: BLE001
     got = e
 check("B3 Coinbase, touch OUTSIDE the band (ask $1.91 against a $2.00 reference): refused before "
       "anything is sent", isinstance(got, Refused) and c.sent == [] and "band" in str(got), (got, c.sent))
 got = None
 try:
-    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, ordertype="market")
+    c.place("XLM", "sell", 10.0, live=True, ref_px=2.0, ordertype="market",
+            permit=permit("coinbase", "XLM", "sell", 20.0))
 except Exception as e:                                           # noqa: BLE001
     got = e
 check("B4 Coinbase asked for a MARKET order with a reference price: refused -- a market order "
-      "has no band", isinstance(got, Refused) and c.sent == [], (got, c.sent))
+      "has no band", isinstance(got, Refused) and c.sent == [] and "band" in str(got), (got, c.sent))
 
 
 class Robin(V.RobinhoodVenue):
@@ -302,8 +295,8 @@ class Robin(V.RobinhoodVenue):
 
 
 rb = Robin()
-rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a)
-rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a)
+rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
+rb.place("XLM", "sell", 10.0, live=True, ref_px=2.0, client_ref=a, permit=permit("robinhood", "XLM", "sell", 20.0))
 b1, b2 = rb.sent[0][2], rb.sent[1][2]
 check("B5 Robinhood, with a reference price: a LIMIT at the band's edge, not a market order",
       b1.get("type") == "limit" and abs(float(b1["limit_order_config"]["limit_price"]) - 1.98) < 1e-9, b1)

@@ -125,6 +125,26 @@ def _iso_epoch(s):
         return None
 
 
+# R1 (2026-11-12): A LIVE ORDER NEEDS A PERMIT THE GATE RECORDED. Every
+# place() below took `live=True` from whoever called it, and that was the
+# whole of the decision at this layer. Now a live order is sent only against
+# a permit guards.live_gate recorded -- in its own memory, for this venue,
+# symbol and side, good once and for two minutes -- after judging the order
+# from disk. Called with live=True and no such permit, an adapter sends
+# nothing. The adapters' own lowest senders refuse an order-placing call that
+# did not come through place() for the same reason.
+def _live_permit(permit, venue_name, symbol, side):
+    """The declared dollars the gate permitted for this order; VenueRefused
+    when there is no such permit."""
+    try:
+        import guards
+        return guards.consume_permit(permit, venue_name, symbol, str(side).lower())
+    except Exception as e:                                       # noqa: BLE001
+        raise VenueRefused("no live permit for this order (%s) -- a live order is sent only "
+                           "for an order the gate judged from disk; nothing was sent"
+                           % (str(e)[:80] or type(e).__name__)) from None
+
+
 def _own_credential(path):
     try:
         key_scope.refuse_shared_credential(path)
@@ -228,6 +248,12 @@ class KrakenVenue:
 
     # -- signed calls -------------------------------------------------------
     def _private(self, endpoint, data=None):
+        # R1: an order that books is sent only from inside place(), which has
+        # consumed the gate's permit.
+        if (endpoint == "AddOrder" and (data or {}).get("validate") != "true"
+                and not getattr(self, "_sending_live", False)):
+            raise VenueRefused("kraken: AddOrder without validate was called outside place() "
+                               "-- nothing was sent")
         key, secret = self._creds()
         path = f"/0/private/{endpoint}"
         data = dict(data or {})
@@ -334,7 +360,7 @@ class KrakenVenue:
     LIVE_ORDER = "limit, immediate-or-cancel, no worse than PRICE_BAND from the reference price"
 
     def place(self, symbol, side, qty, live=False, ordertype="market", price=None,
-              ref_px=None, client_ref=None):
+              ref_px=None, client_ref=None, permit=None, declared_usd=None):
         """side is 'buy'/'sell'. Returns a dict describing what happened.
 
         live=False sends Kraken's own `validate=true`: the order is fully
@@ -352,6 +378,8 @@ class KrakenVenue:
         already closed. It is the handle OpenOrders and ClosedOrders can be
         asked by.
         """
+        if live:
+            declared_usd = _live_permit(permit, self.name, symbol, side)      # R1
         try:
             m = self.meta(symbol)
         except VenueError as e:
@@ -387,7 +415,11 @@ class KrakenVenue:
             data["validate"] = "true"
         elif client_ref:
             data["cl_ord_id"] = str(client_ref)
-        res = self._private("AddOrder", data)
+        self._sending_live = bool(live)
+        try:
+            res = self._private("AddOrder", data)
+        finally:
+            self._sending_live = False
         txid = res.get("txid")
         if isinstance(txid, list):                  # Kraken returns a list of ids
             txid = txid[0] if len(txid) == 1 else (",".join(str(x) for x in txid) or None)
@@ -546,6 +578,11 @@ class CoinbaseVenue:
         return f"{si}.{b64u(key.sign(si.encode()))}"
 
     def _call(self, method, path, body=None):
+        # R1: an order that books is sent only from inside place(), which has
+        # consumed the gate's permit.
+        if (method == "POST" and path.rstrip("/") == "/api/v3/brokerage/orders"
+                and not getattr(self, "_sending_live", False)):
+            raise VenueRefused("coinbase: POST /orders was called outside place() -- nothing was sent")
         _ipv4_only()
         tok = self._jwt(method, path)
         data = json.dumps(body).encode() if body is not None else None
@@ -691,7 +728,7 @@ class CoinbaseVenue:
     LIVE_ORDER = "limit, post-only at the touch, good for MAKER_TTL_S, no worse than PRICE_BAND from the reference price"
 
     def place(self, symbol, side, qty, live=False, ordertype=None, price=None, day=None,
-              ref_px=None, client_ref=None):
+              ref_px=None, client_ref=None, permit=None, declared_usd=None):
         """ordertype: None -> the venue default (post-only maker at the touch when
         MAKER_BY_DEFAULT, else market); "market" -> take, deliberately;
         "maker" -> post-only at the touch; "limit" -> post-only GTD at `price`.
@@ -702,6 +739,8 @@ class CoinbaseVenue:
         sent. `client_ref`, when given, is the client_order_id: Coinbase
         returns the EXISTING order for a client_order_id it has already seen
         rather than creating another, so here it is a real idempotency key."""
+        if live:
+            declared_usd = _live_permit(permit, self.name, symbol, side)      # R1
         try:
             m = self.meta(symbol)
         except VenueError as e:
@@ -771,7 +810,11 @@ class CoinbaseVenue:
             day = day or time.strftime("%Y-%m-%d")
             body["client_order_id"] = str(client_ref) if client_ref else hashlib.sha256(
                 f"covenant:{day}:{m['product_id']}:{side.upper()}:{size_s}".encode()).hexdigest()[:32]
-        res = self._call("POST", path, body)
+        self._sending_live = bool(live)
+        try:
+            res = self._call("POST", path, body)
+        finally:
+            self._sending_live = False
         if live and not res.get("success", True):
             # H10: Coinbase answered, and the answer is success=false with an
             # error_response. Nothing was booked.
@@ -853,6 +896,11 @@ class RobinhoodVenue:
         return self._k
 
     def _call(self, method, path, body=None):
+        # R1: an order that books is sent only from inside place(), which has
+        # consumed the gate's permit.
+        if (method == "POST" and "/crypto/trading/orders" in path
+                and not getattr(self, "_sending_live", False)):
+            raise VenueRefused("robinhood: POST /orders was called outside place() -- nothing was sent")
         key, priv = self._creds()
         payload = json.dumps(body) if body else ""
         ts = str(int(time.time()))
@@ -948,9 +996,11 @@ class RobinhoodVenue:
     LIVE_ORDER = "limit at the band's edge, no worse than PRICE_BAND from the reference price"
 
     def place(self, symbol, side, qty, live=False, ordertype="market",
-              price=None, ref_px=None, client_ref=None):
+              price=None, ref_px=None, client_ref=None, permit=None, declared_usd=None):
         if side.lower() not in ("buy", "sell"):
             raise VenueRefused(f"robinhood: bad side {side!r}")
+        if live:
+            declared_usd = _live_permit(permit, self.name, symbol, side)      # R1
         try:
             m = self.meta(symbol)
         except VenueError as e:
@@ -998,7 +1048,11 @@ class RobinhoodVenue:
         body = {"symbol": m["pair"], "client_order_id": coid,
                 "side": side.lower(), "type": ordertype,
                 f"{ordertype}_order_config": config}
-        res = self._call("POST", "/api/v1/crypto/trading/orders/", body)
+        self._sending_live = True
+        try:
+            res = self._call("POST", "/api/v1/crypto/trading/orders/", body)
+        finally:
+            self._sending_live = False
         return {"venue": self.name, "live": True, "venue_validated": True,
                 "symbol": symbol.upper(), "side": side.lower(), "qty": size,
                 "product": m["pair"], "descr": json.dumps(res)[:120],

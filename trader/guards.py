@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import witness   # Sentinel-Witness: covenant holds the floors, a halt, the day's approval
+import key_scope  # H9/R1: what a venue's key may do -- judged there, no network code
 
 
 # ---- H1 (2026-11-12): WHAT COUNTS AS AN AMOUNT -------------------------------
@@ -1877,6 +1878,213 @@ def approval_reasons(order, approval, orders_today=None, now=None):
             "than the one approved and at most %.0f%% under it"
             % (side, sym, usd, ", ".join("$%.2f" % p[2] for p in same),
                APPROVAL_SIZE_TOLERANCE * 100)]
+
+
+# ===========================================================================
+# R1 (2026-11-12): THE LIVE GATE TAKES NO DECISION FROM ITS CALLER.
+#
+# Review round one, confirmed by the outside reviewer: every check above is
+# made on the config dict and the state dict a caller hands in, plus three
+# things the caller simply asserts -- "it was sealed", "the guards did not
+# block", "here is what was approved". covenant_trader.run_once hands in the
+# truth. A Python caller that hands in {"armed": true, "armed_until": ...,
+# "daily_plan_required": false, "min_sealed_signals": 0} and sealed_ok=True
+# cleared all of it, and execute() went live on the result.
+#
+# live_gate() is the one thing that now turns "this order may go live" from
+# false to true, and it judges FROM DISK, itself:
+#
+#   * the config: trader_config.json, read here, over the shipped defaults --
+#     its caps and ceilings, its arming and expiry, the armed terms, the
+#     pinned witness folder. A config handed in is only COMPARED: if it
+#     differs from the file in any gate-relevant key, that is a refusal.
+#   * the state: the trader's state file, read here -- the day's count, the
+#     lifetime totals, the Rule 5 record, the clock marks. A state handed in
+#     is only compared, the same way.
+#   * the seal: witness.seal_reasons -- what THIS process has seen covenant
+#     admit, not a caller's True.
+#   * the approval: witness.approval_record, asked here.
+#   * the venue's key: key_scope.key_reasons, asked here.
+#   * the buy-side guards: evaluated here, on the caller's portfolio
+#     MEASUREMENTS (equity, positions, cash) and the disk state's history.
+#     A caller may add a block; it cannot remove one.
+#
+# When nothing refuses, the gate records a PERMIT in this module's own memory
+# -- one order, one venue, one use, PERMIT_VALID_S -- and returns its id. A
+# venue adapter's place(live=True) sends nothing without consuming one
+# (venues._live_permit), so calling the venue directly places nothing either.
+#
+# WHAT THIS IS NOT. It is not a defence against code running in this process
+# that reaches into this module's privates, replaces its functions, or edits
+# the files on disk: Python has no such boundary, and the files belong to the
+# same OS user. It closes the road the reviewer walked -- the public
+# functions' own arguments.
+# ===========================================================================
+GATE_KEYS = (
+    "armed", "armed_until", "max_order_usd", "max_daily_notional_usd", "max_orders_per_day",
+    "min_order_usd", "max_position_pct", "min_cash_pct", "seal_required", "min_sealed_signals",
+    "rule5_require_significance", "daily_plan_required", "rule5_waiver", "trading_scope",
+    "allow_fiat_buys", "weekly_fiat_budget_usd", "contribution_min_cash_pct",
+    "contribution_symbols", "symbols", "covenant_home")
+STATE_GATE_KEYS = ("day", "last_seen_day", "last_seen_at", "orders_today", "bought_total_usd",
+                   "fiat_buys", "sealed_signals", "rule5", "last_sold", "closed_trades")
+PERMIT_VALID_S = 120.0
+_PERMITS = {}
+
+
+def _same_value(a, b):
+    """Equal as config or state values: numbers by value (25 and 25.0), a bool
+    only with a bool, anything else by its JSON."""
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    if num(a) and num(b):
+        return float(a) == float(b)
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    try:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+
+
+def config_differs(handed, disk):
+    """The gate-relevant keys in which a config handed in differs from the one
+    on disk (both over the shipped defaults). [] when it does not."""
+    a = with_defaults(handed if isinstance(handed, dict) else None)
+    b = with_defaults(disk if isinstance(disk, dict) else None)
+    return [k for k in GATE_KEYS if not _same_value(a.get(k), b.get(k))]
+
+
+def state_differs(handed, disk):
+    """The gate-relevant keys in which a state handed in differs from the
+    state file. [] when it does not."""
+    a = handed if isinstance(handed, dict) else {}
+    b = disk if isinstance(disk, dict) else {}
+    return [k for k in STATE_GATE_KEYS if not _same_value(a.get(k), b.get(k))]
+
+
+def _issue_permit(venue_name, sym, side, usd):
+    """Record a permit for one live order and return its id. Called by
+    live_gate when nothing refused, and by nothing else in this program."""
+    import secrets
+    now = time.time()
+    for k in [k for k, p in _PERMITS.items() if p["used"] or p["expires"] < now]:
+        del _PERMITS[k]
+    pid = secrets.token_hex(16)
+    _PERMITS[pid] = {"venue": str(venue_name), "sym": str(sym).strip().upper(),
+                     "side": str(side), "usd": float(usd), "expires": now + PERMIT_VALID_S,
+                     "used": False}
+    return pid
+
+
+def consume_permit(pid, venue_name, sym, side):
+    """The declared dollars permit `pid` covers, marking it used. ValueError
+    when there is no such permit for this venue, symbol and side, or it has
+    been used or has expired."""
+    p = _PERMITS.get(pid) if isinstance(pid, str) else None
+    if p is None:
+        raise ValueError("there is no such permit")
+    if p["used"]:
+        raise ValueError("the permit has already been used")
+    if time.time() > p["expires"]:
+        raise ValueError("the permit has expired")
+    if (p["venue"], p["sym"], p["side"]) != (str(venue_name), str(sym).strip().upper(), str(side)):
+        raise ValueError("the permit is for another order")
+    p["used"] = True
+    return p["usd"]
+
+
+def live_gate(order, venue, cfg=None, st=None, portfolio=None, caller_blocks=None):
+    """(reasons, permit). `permit` is an id only when `reasons` is empty.
+
+    order          {"sym", "side", "usd", "qty"}
+    venue          the adapter the order would go to (asked about its key)
+    cfg, st        what the caller holds -- COMPARED with disk, never judged
+    portfolio      a guards.State of the book as the caller measured it; needed
+                   for a buy, whose guards are evaluated here
+    caller_blocks  reasons the caller wants added. Append only.
+
+    Reads the clock, the config, the state, the witness and the venue itself.
+    There is deliberately no `now`, no `sealed_ok`, no `approval` and no path
+    argument: each would be a decision, or a way to choose one."""
+    reasons = []
+    name = getattr(venue, "name", None)
+    if venue is None or not isinstance(name, str):
+        return ["live gate: no venue to send the order to"], None
+
+    # -- the config, from disk -------------------------------------------------
+    cstate = path_state(CONFIG_PATH)
+    if cstate == "absent":
+        reasons.append("live gate: there is no trader_config.json on disk (%s), so nothing "
+                       "is armed" % CONFIG_PATH)
+    disk = load_config(CONFIG_PATH)
+    if cfg is not None:
+        diff = config_differs(cfg, disk)
+        if diff:
+            reasons.append("live gate: the config handed in differs from trader_config.json on "
+                           "disk in %s -- refused; the gate judges the file, not what it is "
+                           "handed" % ", ".join(diff))
+
+    # -- the state, from disk ---------------------------------------------------
+    dst = load_trader_state(TRADER_STATE)
+    if dst is None:
+        dst = {}                      # preconditions below says STATE_UNREADABLE
+    elif st is not None:
+        diff = state_differs(st, dst)
+        if diff:
+            reasons.append("live gate: the state handed in differs from the trader's state "
+                           "file in %s -- refused; the day's count is read from the file"
+                           % ", ".join(diff))
+
+    # -- the seal, from what this process saw covenant admit ---------------------
+    try:
+        seal_why = list(witness.seal_reasons(order))
+    except Exception as e:                                       # noqa: BLE001
+        seal_why = ["seal: could not be checked (%s)" % type(e).__name__]
+
+    # -- the buy-side guards, evaluated here -------------------------------------
+    blocks = []
+    if order.get("side") == "buy":
+        if not isinstance(portfolio, State):
+            reasons.append("live gate: no portfolio was supplied, so the buy-side guards (cash "
+                           "floor, concentration, budgets) could not be evaluated")
+        else:
+            import dataclasses
+            book = dataclasses.replace(
+                portfolio, orders_today=orders_today_from(dst),
+                bought_total_usd=dst.get("bought_total_usd"),
+                fiat_buys_week=fiat_buys_week_from(dst),
+                last_sold=dict(dst.get("last_sold") or {}),
+                closed_trades=list(dst.get("closed_trades") or []),
+                starting_total_usd=None, now=time.time())
+            try:
+                ok, blocking, _all = GuardStack().may_buy(book, order.get("sym"))
+                blocks = [] if ok else [b.guard for b in blocking]
+            except Exception as e:                               # noqa: BLE001
+                blocks = ["guards unavailable (%s)" % type(e).__name__]
+        blocks += [str(b) for b in (caller_blocks or [])]
+
+    # -- everything preconditions knows, on the DISK config and DISK state --------
+    for r in preconditions(order, cfg=None, st=None, sealed_ok=not seal_why,
+                           guard_blocks=blocks, caller="trader",
+                           config_path=CONFIG_PATH, state_path=TRADER_STATE):
+        if r not in reasons:
+            reasons.append(r)
+    for r in witness.terms_reasons(disk) + seal_why:
+        if r not in reasons:
+            reasons.append(r)
+
+    # -- the approval and the key: asked only for an order still standing ----------
+    if not reasons:
+        try:
+            record = witness.approval_record(cfg=disk)
+        except Exception as e:                                   # noqa: BLE001
+            record = {"ok": False, "why": "%s: %s" % (type(e).__name__, str(e)[:80])}
+        reasons += approval_reasons(order, record, orders_today_from(dst))
+    if not reasons:
+        reasons += key_scope.key_reasons(venue)
+    if reasons:
+        return reasons, None
+    return [], _issue_permit(name, order["sym"], order["side"], order["usd"])
 
 
 # ---- WHICH REASONS ARE A DECISION, AND WHICH ARE THE ABSENCE OF ONE --------

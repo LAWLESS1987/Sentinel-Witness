@@ -213,6 +213,16 @@ _saved = []
 T.save_state = lambda st: _saved.append(json.dumps(st, sort_keys=True))
 armed = dict(T.DEFAULT_CONFIG)
 armed.update({"armed": True, "armed_until": _ARMED_UNTIL, "seal_required": False, "rule5_require_significance": False, "daily_plan_required": False})
+# R1 (2026-11-12): what makes an order live is no longer anything a caller
+# hands to execute(). guards.live_gate judges the config and state on DISK, the
+# witness and the venue, and this harness's dict -- armed, with the other gates
+# switched off -- can no longer go live at all (test_r01_live_gate.py is where
+# that is driven). What is under test HERE is the bookkeeping execute() does
+# once an order IS allowed, so the gate is replaced for the length of the run,
+# exactly as preconditions() is and for the same reason. Replacing a module's
+# function from inside the process is the one door R1 does not, and cannot,
+# close; a suite using it says so.
+T._guards.live_gate = lambda *a, **k: ([], "rule5-bookkeeping-harness")
 def run(stub):
     T.venue_for = lambda o, lv: stub
     T.V.all_venues = lambda: [stub]

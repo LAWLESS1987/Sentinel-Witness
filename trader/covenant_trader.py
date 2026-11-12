@@ -1174,7 +1174,7 @@ def venue_for(order, live_venues):
 
 
 def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
-            may_buy=None, approval=None):
+            may_buy=None, approval=None, portfolio=None):
     """`may_buy` -- optional callable sym -> [blocking guard names]. A83.
 
     THE GUARD STACK WAS ASKED WITHOUT A SYMBOL, so the asset-specific guards
@@ -1192,12 +1192,16 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
     enforces -- a rule about what may be sold has no view on what may be
     bought, and a guard never stops a sale.
     """
-    # H8 (2026-11-12): `approval` -- covenant's record of what was approved
-    # today (witness.approval_record). Asked for once, and only when an order
-    # has cleared everything else and is about to go live; a test hands one in.
-    # plan_only never asks: nothing it does can place an order.
-    binding = None if plan_only else {"record": approval}
-    key_cache = {}                # H9: each venue's key is asked about once per cycle
+    # R1 (2026-11-12): NOTHING THIS FUNCTION IS HANDED CAN MAKE AN ORDER LIVE.
+    # `cfg`, `st`, `sealed_ok`, `guard_blocks`, `may_buy` and `approval` are a
+    # caller's -- and a caller with a permissive dict and sealed_ok=True used
+    # to be believed. They now work in one direction only: the first pass
+    # below (preconditions on what was handed in) can REFUSE, and what it lets
+    # through is then judged by guards.live_gate from the config and state on
+    # DISK, the witness and the venue, which hands back a permit or reasons.
+    # `approval` is kept in the signature and ignored: the gate asks covenant.
+    # `portfolio` is the book as run_once measured it (a guards.State); the
+    # gate evaluates a buy's guards on it.
     live_venues = [v for v in V.all_venues() if v.has_credentials()]
     results = []
     for o in orders:
@@ -1220,10 +1224,8 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
         # H9: the venue is chosen BEFORE the question is asked, because one of
         # the things that must say yes is that venue's key.
         v = venue_for(o, live_venues)
-        bad = preconditions(cfg, st, {}, o, sealed_ok,
-                            list(guard_blocks) + extra if extra else guard_blocks,
-                            approval=binding,
-                            venue=None if plan_only else v, key_cache=key_cache)
+        blocks = list(guard_blocks) + extra if extra else guard_blocks
+        bad = preconditions(cfg, st, {}, o, sealed_ok, blocks)
         if v is None:
             results.append({**o, "status": "NO VENUE",
                             "detail": "no credentialed venue holds it"})
@@ -1231,7 +1233,22 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
         if plan_only:
             results.append({**o, "status": "PLAN ONLY", "detail": "no venue call"})
             continue
-        go_live = not bad
+        # R1: THE GATE. Only an order the first pass let through is asked
+        # about, and only the gate's permit makes it live.
+        permit = None
+        if not bad:
+            if _guards is None:
+                bad = ["guards.py unavailable -- the live gate cannot be asked"]
+            else:
+                try:
+                    bad, permit = _guards.live_gate(
+                        o, v, cfg=cfg, st=st, portfolio=portfolio,
+                        caller_blocks=list(blocks or []) if o.get("side") == "buy" else None)
+                    bad = list(bad)
+                except Exception as e:                            # noqa: BLE001
+                    bad, permit = ["live gate failed (%s: %s) -- nothing goes live"
+                                   % (type(e).__name__, str(e)[:80])], None
+        go_live = (not bad) and permit is not None
         pending = None
         fiat_part = float(o["usd"])
         # H10 (2026-11-12): THE REFERENCE PRICE AND THE CLIENT REFERENCE.
@@ -1283,7 +1300,8 @@ def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             save_state(st)
         try:
             r = v.place(o["sym"], o["side"], o["qty"], live=go_live,
-                        **_place_kwargs(v, ref_px=ref_px, client_ref=cref))
+                        **_place_kwargs(v, ref_px=ref_px, client_ref=cref,
+                                        permit=permit, declared_usd=float(o["usd"])))
             results.append({**o, "status": "PLACED" if go_live else "VALIDATED",
                             "detail": r.get("descr") or "", "txid": r.get("txid"),
                             "blocked_by": bad, "venue": v.name})
@@ -1687,8 +1705,12 @@ def run_once(cfg, plan_only=False):
         ok, blocks, _v = _guards.GuardStack().may_buy(state, sym)
         return [] if ok else [b.guard for b in blocks]
 
+    # R1: the gate reads the state FILE. What this cycle has just learned --
+    # the day rolled, the clock marks, the Rule 5 record -- is written before
+    # any order is considered, so the file the gate judges is this cycle's.
+    save_state(st)
     results = execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only,
-                      may_buy=_may_buy)
+                      may_buy=_may_buy, portfolio=state)
     if results:
         print("\n  ORDERS")
         for r in results:

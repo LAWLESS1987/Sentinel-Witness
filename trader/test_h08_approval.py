@@ -217,90 +217,60 @@ check("W7 ARMED with an unpinned folder: ok=false and NO Python is run (H6's pin
 
 
 # ---- X: execute() ----------------------------------------------------------------------
-class FakeVenue:
-    name = "fake"
-
-    def __init__(self):
-        self.calls = []
-
-    def has_credentials(self):
-        return True
-
-    # A clean, trade-only venue, for the later items of this pass (H9, H10).
-    def key_permissions(self):
-        return {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "fake"}
-
-    def open_orders_norm(self):
-        return []
-
-    def recent_fills(self, since=None):
-        return []
-
-    def reference_price(self, sym):
-        return 1.0
-
-    def place(self, sym, side, qty, live=False, **kw):
-        self.calls.append((sym, side, live))
-        return {"descr": "fake", "txid": "TX" if live else None}
+# R1 (2026-11-12): an order goes live only through guards.live_gate, which
+# judges the config and state on DISK, the witness and the venue. The dict
+# fixture this section used -- armed, with the other gates switched off --
+# can no longer go live at all, so it now runs on gated_fixture.Gated: every
+# gate satisfied, on disk, with a stand-in covenant, and then the ONE thing
+# this section is about is varied.
+# Since R1 the record is never handed to execute(): the gate asks covenant.
+# Here "covenant" is the fixture's stand-in, answering with `rec`.
+from gated_fixture import Gated, Venue   # noqa: E402
 
 
-UNTIL = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
-CFG = {"armed": True, "armed_until": UNTIL, "daily_plan_required": True, "seal_required": True,
-       "min_sealed_signals": 0, "rule5_require_significance": False, "min_order_usd": 5.0,
-       "max_order_usd": 25.0, "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}
+def full(o):
+    return dict(o, px=1.0, at={"fake": 1000.0})
 
 
-def run_execute(orders, approval, fetched=None, plan_only=False, cfg=None):
-    """execute() with covenant's yes/no gate stubbed to YES, so that what
-    decides is the binding. `fetched` stands in for witness.approval_record
-    when no approval is handed in."""
-    fv = FakeVenue()
-    asked = []
-    keep = (T.V.all_venues, T.STATE, T.save_state, W.daily_plan_gate_reasons,
-            getattr(W, "approval_record", None))
-    st = {"day": TODAY, "orders_today": []}
-    try:
-        T.V.all_venues = lambda: [fv]
-        T.STATE = os.path.join(tempfile.mkdtemp(), "trader_state.json")
-        T.save_state = lambda s: None
-        W.daily_plan_gate_reasons = lambda now=None, cfg=None, runner=None: []
-        W.approval_record = lambda now=None, cfg=None, runner=None: asked.append(1) or fetched
-        full = [dict(o, px=1.0, at={"fake": 100.0}) for o in orders]
-        kw = {"approval": approval} if approval is not None else {}
-        try:
-            res = T.execute(cfg or CFG, st, full, True, [], plan_only, **kw)
-        except TypeError:                       # the code before the fix takes no approval
-            res = T.execute(cfg or CFG, st, full, True, [], plan_only)
-    finally:
-        T.V.all_venues, T.STATE, T.save_state, W.daily_plan_gate_reasons = keep[:4]
-        if keep[4] is not None:
-            W.approval_record = keep[4]
-    return res, fv, st, asked
+def run_execute(orders, rec, **cfg_on_disk):
+    """execute() with every other gate satisfied and covenant's record of the
+    day being `rec`. Returns (results, the venue, today's rows on disk, which
+    of covenant's scripts were asked)."""
+    with Gated(approval=rec, cfg=cfg_on_disk) as fx:
+        fv = Venue()
+        res = fx.execute([full(o) for o in orders], [fv])
+        return res, fv, fx.state_on_disk()["orders_today"], list(fx.asked)
 
 
-res, fv, st, _ = run_execute([order(), order("ETH", "sell", 25.0)], record())
+res, fv, rows, _ = run_execute([order(), order("ETH", "sell", 25.0)], record())
 check("X1 the approved order goes LIVE; the one the plan never proposed goes to the DRY RUN only",
-      fv.calls == [("XLM", "sell", True), ("ETH", "sell", False)]
+      [(c["sym"], c["live"]) for c in fv.calls] == [("XLM", True), ("ETH", False)]
       and [r["status"] for r in res] == ["PLACED", "VALIDATED"], (fv.calls, [r["status"] for r in res]))
 check("X1b ...only the approved one is in the day's record, and the other says why it was held back",
-      [r["sym"] for r in st["orders_today"]] == ["XLM"]
-      and any("not in the approved plan" in b for b in res[1]["blocked_by"]), (st, res[1].get("blocked_by")))
-res, fv, st, _ = run_execute([order(), order()], record())
+      [r["sym"] for r in rows] == ["XLM"]
+      and any("not in the approved plan" in b for b in res[1]["blocked_by"]), (rows, res[1].get("blocked_by")))
+res, fv, rows, _ = run_execute([order(), order()], record())
 check("X2 the same approved order twice in one cycle: the first goes live, the second does not",
-      [c[2] for c in fv.calls] == [True, False] and len(st["orders_today"]) == 1, fv.calls)
-res, fv, st, _ = run_execute([order()], record(decisions=[ap, de]))
+      fv.live() == [True, False] and len(rows) == 1
+      and any("already" in b for b in res[1]["blocked_by"]), (fv.live(), res[1].get("blocked_by")))
+res, fv, rows, _ = run_execute([order()], record(decisions=[ap, de]))
 check("X3 with a decline in the day's record nothing goes live",
-      [c[2] for c in fv.calls] == [False] and st["orders_today"] == [], fv.calls)
-res, fv, st, asked = run_execute([order()], None, fetched={"ok": False, "why": "covenant has no approval_record"})
-check("X4 with no record handed in, the witness is ASKED; when it has none, nothing goes live "
-      "and the reason is on the order", asked == [1] and [c[2] for c in fv.calls] == [False]
-      and any("unavailable" in b for b in res[0]["blocked_by"]), (asked, fv.calls, res[0].get("blocked_by")))
-res, fv, st, asked = run_execute([order()], None, fetched=record())
-check("X5 ...and when the witness has the record, the approved order goes live",
-      asked == [1] and [c[2] for c in fv.calls] == [True], (asked, fv.calls))
-res, fv, st, asked = run_execute([order()], None, fetched=record(), cfg=dict(CFG, armed=False))
+      fv.live() == [False] and rows == [] and any("DECLINED" in b for b in res[0]["blocked_by"]),
+      (fv.live(), res[0].get("blocked_by")))
+res, fv, rows, asked = run_execute([order()], {"ok": False, "why": "covenant has no approval_record"})
+check("X4 covenant is ASKED for the record; when it has none, nothing goes live and the reason "
+      "is on the order", asked.count("approval") == 1 and fv.live() == [False]
+      and any("unavailable" in b for b in res[0]["blocked_by"]), (asked, fv.live(), res[0].get("blocked_by")))
+res, fv, rows, asked = run_execute([order()], record())
+check("X5 ...and when covenant has the record, the approved order goes live",
+      asked.count("approval") == 1 and fv.live() == [True], (asked, fv.live(), res[0].get("blocked_by")))
+res, fv, rows, asked = run_execute([order()], record(), armed=False)
 check("X6 a DISARMED cycle never asks for the record at all (nothing could go live)",
-      asked == [] and [c[2] for c in fv.calls] == [False], (asked, fv.calls))
+      "approval" not in asked and fv.live() == [False], (asked, fv.live()))
+res, fv, rows, asked = run_execute([order()], record(orders=[]))
+check("X7 covenant's plan for the day proposes NO orders: nothing goes live",
+      fv.live() == [False] and any("proposes NO orders" in b for b in res[0]["blocked_by"]),
+      (fv.live(), res[0].get("blocked_by")))
 
 n = len(results)
 print(f"\nH8 approval: {sum(results)}/{n} passed")

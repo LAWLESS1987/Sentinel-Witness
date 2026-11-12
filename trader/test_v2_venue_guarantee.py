@@ -243,9 +243,13 @@ def main():
     _armed = _G.preconditions(_order, cfg={"armed": True, "min_sealed_signals": 0,
                                            "rule5_require_significance": False},
                               st={"sealed_signals": 0})
-    check("T2 go_live is 'no blocker fired', and armed=false IS a blocker "
-          "-- run, not grepped",
-          "go_live = not bad" in tsrc
+    # R1 (2026-11-12): the line this reads for was `go_live = not bad`. It is
+    # now `go_live = (not bad) and permit is not None`: no blocker fired AND
+    # guards.live_gate, judging from disk, recorded a permit. The behavioural
+    # half below is unchanged.
+    check("T2 go_live is 'no blocker fired' (and, since R1, a permit from the "
+          "live gate), and armed=false IS a blocker -- run, not grepped",
+          "go_live = (not bad) and permit is not None" in tsrc
           and any("armed=false" in r for r in _unarmed)
           and not any("armed=false" in r for r in _armed), (_unarmed, _armed))
     check("T2b ...and the blocker comes from the ONE implementation both the "

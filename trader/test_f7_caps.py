@@ -124,14 +124,24 @@ def book(T, st, order):
     ALLOWED through -- whether it is allowed at all is S4f/S4g's job, and
     satisfying armed + seal + Rule 5 here would test those twice and this once.
     All three are restored on the way out, including on a failure."""
-    saved = (T.V.all_venues, T.save_state, T.preconditions)
+    # R1 (2026-11-12): what makes an order live is no longer anything a caller
+    # hands to execute(). guards.live_gate judges the config and state on DISK, the
+    # witness and the venue, and this harness's dict -- armed, with the other gates
+    # switched off -- can no longer go live at all (test_r01_live_gate.py is where
+    # that is driven). What is under test HERE is the bookkeeping execute() does
+    # once an order IS allowed, so the gate is replaced for the length of the run,
+    # exactly as preconditions() is and for the same reason. Replacing a module's
+    # function from inside the process is the one door R1 does not, and cannot,
+    # close; a suite using it says so.
+    saved = (T.V.all_venues, T.save_state, T.preconditions, T._guards.live_gate)
     T.V.all_venues = lambda: [_StubVenue()]
     T.save_state = lambda _s: None
     T.preconditions = lambda *a, **k: []
+    T._guards.live_gate = lambda *a, **k: ([], "f7-bookkeeping-harness")
     try:
         T.execute({}, st, [dict(order, at={"stub": 1.0})], True, [])
     finally:
-        T.V.all_venues, T.save_state, T.preconditions = saved
+        T.V.all_venues, T.save_state, T.preconditions, T._guards.live_gate = saved
     return st
 
 
@@ -420,6 +430,11 @@ def main():
 
     _fv = _FakeVenue()
     _real_all = T.V.all_venues
+    # R1: B9b-B9d are about what execute() writes and asks once an order is
+    # allowed; the live gate is replaced for them, as in book() above (where
+    # the reason is written out), and restored after B9d.
+    _real_gate = T._guards.live_gate
+    T._guards.live_gate = lambda *a, **k: ([], "f7-bookkeeping-harness")
     _st = {"day": time.strftime("%Y-%m-%d"), "orders_today": [], "last_sold": {},
            "closed_trades": [], "bought_total_usd": 0.0, "equity_peak": 100.0,
            "equity_start_of_day": 100.0}
@@ -479,6 +494,7 @@ def main():
     finally:
         T.V.all_venues = _real_all
         T.STATE = _saved_state_path
+    T._guards.live_gate = _real_gate
     check("B9d ...and it is NOT asked about a SALE -- a guard never stops a sale",
           _seen2 == [], _seen2)
 

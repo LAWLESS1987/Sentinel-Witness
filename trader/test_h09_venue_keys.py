@@ -204,78 +204,58 @@ check("E1 with no fetch handed in, Kraken is asked GetApiKeyInfo and Coinbase GE
 
 
 # ---- X: execute() ------------------------------------------------------------------------
-class FakeVenue:
-    def __init__(self, name, perms):
-        self.name, self._perms, self.calls, self.asked = name, perms, [], 0
+# R1 (2026-11-12): an order goes live only through guards.live_gate, which
+# judges the config and state on DISK, the witness and the venue. The dict
+# fixture this section used -- armed, with the other gates switched off --
+# can no longer go live at all, so it now runs on gated_fixture.Gated: every
+# gate satisfied, on disk, with a stand-in covenant, and then the ONE thing
+# this section is about is varied.
+from gated_fixture import Gated, Venue, order as gated_order   # noqa: E402
 
-    def has_credentials(self):
-        return True
-
-    def key_permissions(self, fetch=None):
-        self.asked += 1
-        if isinstance(self._perms, Exception):
-            raise self._perms
-        return dict(self._perms)
-
-    def open_orders_norm(self):
-        return []
-
-    def recent_fills(self, since=None):
-        return []
-
-    def place(self, sym, side, qty, live=False, **kw):
-        self.calls.append((sym, live))
-        return {"descr": "fake", "txid": "TX" if live else None}
-
-
-UNTIL = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
-CFG = {"armed": True, "armed_until": UNTIL, "daily_plan_required": False, "seal_required": True,
-       "min_sealed_signals": 0, "rule5_require_significance": False, "min_order_usd": 5.0,
-       "max_order_usd": 25.0, "max_orders_per_day": 2, "max_daily_notional_usd": 50.0}
 CLEAN = {"can_trade": True, "can_transfer": False, "can_withdraw": False, "source": "fake"}
 
 
-def run_execute(venues, orders, cfg=None, plan_only=False):
-    keep = (T.V.all_venues, T.STATE, T.save_state)
-    st = {"day": time.strftime("%Y-%m-%d"), "orders_today": []}
-    try:
-        T.V.all_venues = lambda: venues
-        T.STATE = os.path.join(tempfile.mkdtemp(), "trader_state.json")
-        T.save_state = lambda s: None
-        res = T.execute(cfg or CFG, st, orders, True, [], plan_only)
-    finally:
-        T.V.all_venues, T.STATE, T.save_state = keep
-    return res, st
-
-
 def order(sym, venue, usd=20.0):
-    return {"sym": sym, "side": "sell", "qty": usd, "usd": usd, "px": 1.0, "rule": "test", "at": {venue: 100.0}}
+    return gated_order(sym, "sell", usd, venue=venue)
 
 
-good, bad = FakeVenue("good", CLEAN), FakeVenue("bad", dict(CLEAN, can_withdraw=True))
-res, st = run_execute([good, bad], [order("XLM", "good"), order("ADA", "bad", 25.0)])
+def run_execute(venues, orders, plan_only=False, **cfg_on_disk):
+    """execute() with every other gate satisfied (the plan proposes exactly
+    these orders); what varies is the VENUE's key. Returns (results, rows)."""
+    with Gated(approved=orders, cfg=cfg_on_disk) as fx:
+        res = fx.execute([dict(o) for o in orders], venues, plan_only=plan_only)
+        return res, fx.state_on_disk()["orders_today"]
+
+
+def calls(v):
+    return [(c["sym"], c["live"]) for c in v.calls]
+
+
+good, bad = Venue("good", CLEAN), Venue("bad", dict(CLEAN, can_withdraw=True))
+res, rows = run_execute([good, bad], [order("XLM", "good"), order("ADA", "bad", 25.0)])
 check("X1 the order at the trade-only venue goes LIVE; the one at the venue whose key can "
-      "withdraw goes to the DRY RUN only", good.calls == [("XLM", True)] and bad.calls == [("ADA", False)]
-      and [r["status"] for r in res] == ["PLACED", "VALIDATED"], (good.calls, bad.calls, [r["status"] for r in res]))
+      "withdraw goes to the DRY RUN only", calls(good) == [("XLM", True)] and calls(bad) == [("ADA", False)]
+      and [r["status"] for r in res] == ["PLACED", "VALIDATED"], (calls(good), calls(bad), [r["status"] for r in res]))
 check("X1b ...and that order says why, and is not in the day's record",
-      any("WITHDRAW" in b for b in res[1]["blocked_by"]) and [r["sym"] for r in st["orders_today"]] == ["XLM"],
-      (res[1].get("blocked_by"), st))
-good = FakeVenue("good", CLEAN)
+      any("WITHDRAW" in b for b in res[1]["blocked_by"]) and [r["sym"] for r in rows] == ["XLM"],
+      (res[1].get("blocked_by"), rows))
+good = Venue("good", CLEAN)
 run_execute([good], [order("XLM", "good"), order("ADA", "good", 25.0)])
-check("X2 two live orders at one venue ask about its key ONCE in the cycle",
-      good.asked == 1 and [c[1] for c in good.calls] == [True, True], (good.asked, good.calls))
-blind = FakeVenue("blind", V.VenueError("HTTP 503: unavailable"))
-res, st = run_execute([blind], [order("XLM", "blind")])
+check("X2 two live orders at one venue: its key is asked about before EACH (the gate asks for "
+      "every order it permits, and keeps nothing a caller could have put there)",
+      good.key_asked == 2 and good.live() == [True, True], (good.key_asked, calls(good)))
+blind = Venue("blind", V.VenueError("HTTP 503: unavailable"))
+res, rows = run_execute([blind], [order("XLM", "blind")])
 check("X3 a venue whose key cannot be asked about (the call fails): nothing goes live",
-      blind.calls == [("XLM", False)] and st["orders_today"] == []
-      and any("cannot be read" in b for b in res[0]["blocked_by"]), (blind.calls, res[0].get("blocked_by")))
-good = FakeVenue("good", CLEAN)
-run_execute([good], [order("XLM", "good")], cfg=dict(CFG, armed=False))
+      calls(blind) == [("XLM", False)] and rows == []
+      and any("cannot be read" in b for b in res[0]["blocked_by"]), (calls(blind), res[0].get("blocked_by")))
+good = Venue("good", CLEAN)
+run_execute([good], [order("XLM", "good")], armed=False)
 check("X4 a DISARMED cycle never asks (nothing could go live), and the order is a dry run",
-      good.asked == 0 and good.calls == [("XLM", False)], (good.asked, good.calls))
-good = FakeVenue("good", CLEAN)
+      good.key_asked == 0 and calls(good) == [("XLM", False)], (good.key_asked, calls(good)))
+good = Venue("good", CLEAN)
 run_execute([good], [order("XLM", "good")], plan_only=True)
-check("X5 a plan-only cycle never asks either, and calls no venue", good.asked == 0 and good.calls == [])
+check("X5 a plan-only cycle never asks either, and calls no venue", good.key_asked == 0 and good.calls == [])
 
 # ---- A: who else can read the credential ---------------------------------------------------
 ME, SYSTEM, ADMINS, EVERYONE, USERS = "S-1-5-21-1-2-3-1001", "S-1-5-18", "S-1-5-32-544", "S-1-1-0", "S-1-5-32-545"

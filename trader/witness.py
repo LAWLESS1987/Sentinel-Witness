@@ -55,6 +55,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "trader_config.json")
@@ -334,6 +335,57 @@ def _refused(detail):
             "detail": detail, "mined": ""}
 
 
+# ---- R1 (2026-11-12): WHAT THIS PROCESS HAS SEEN COVENANT SEAL ---------------
+# covenant_trader.execute() took `sealed_ok` from its caller: a bare True, and
+# the order was "sealed". The live gate (guards.live_gate) no longer accepts
+# that word from anyone. seal_decision_result() below remembers, here, each
+# record covenant ADMITTED -- and only when the answer came through the real
+# runner (_run): an answer obtained through an injected `runner` is a test's
+# stand-in and is never remembered. seal_reasons() is then the one reading:
+# is THIS order in a record covenant admitted within SEAL_VALID_S? A process
+# that has not sealed through covenant has an empty memory and places nothing.
+SEAL_VALID_S = 900.0
+_SEALED = []                 # [(when, [(SYM, side, usd, qty), ...])]
+_clock = time.time           # a test replaces this to move the clock
+
+
+def _order_key(o):
+    try:
+        return (str(o["sym"]).strip().upper(), str(o["side"]), float(o["usd"]), float(o["qty"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _remember_seal(record, out):
+    if not (isinstance(out, dict) and out.get("ok") is True
+            and str(out.get("admission") or "").startswith("admitted")):
+        return
+    rows = record.get("orders") if isinstance(record, dict) else None
+    keys = [k for k in (_order_key(o) for o in (rows if isinstance(rows, list) else [])) if k]
+    _SEALED.append((_clock(), keys))
+    del _SEALED[:-50]
+
+
+def seal_reasons(order):
+    """Why this order is not covered by a seal covenant admitted, as a list;
+    [] when it is. Takes nothing from its caller but the order."""
+    want = _order_key(order)
+    if want is None:
+        return ["seal: the order has no symbol, side, dollars and quantity to look for in a sealed record"]
+    now = _clock()
+    for when, keys in reversed(_SEALED):
+        if now - when > SEAL_VALID_S or when > now + 60:
+            continue
+        for sym, side, usd, qty in keys:
+            if (sym == want[0] and side == want[1]
+                    and abs(usd - want[2]) <= 1e-6 * max(1.0, abs(usd))
+                    and abs(qty - want[3]) <= 1e-6 * max(1.0, abs(qty))):
+                return []
+    return ["seal: this process holds no record, admitted by covenant in the last %d minutes, "
+            "that contains this order -- a caller's word that it was sealed is not taken"
+            % (SEAL_VALID_S // 60)]
+
+
 def seal_decision_result(cfg, record, runner=None):
     """Covenant's seal_decision_result, run in covenant. Same dict shape."""
     # H6: armed, only the pinned folder's Python is run.
@@ -357,6 +409,8 @@ def seal_decision_result(cfg, record, runner=None):
     if not isinstance(out["ok"], bool):
         return _refused("witness: covenant's seal answer had an 'ok' that is "
                         "not true or false (%s)" % type(out["ok"]).__name__)
+    if runner is None:
+        _remember_seal(record, out)          # R1: only an answer from the real runner
     return out
 
 
