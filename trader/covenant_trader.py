@@ -1012,12 +1012,14 @@ def plan(cfg, pf, week_spent=0.0):
     # Shipped OFF (allow_fiat_buys false, budget 0). Every buy it emits is
     # fiat-funded, so FiatBuyPermission and BuyBudget apply to it unchanged.
     weekly = float(cfg.get("weekly_fiat_budget_usd") or 0.0)
-    if cfg.get("allow_fiat_buys") and weekly > 0 and week_spent is None:
+    # R4: a permission is the boolean true. `cfg.get("allow_fiat_buys")` took
+    # anything truthy -- the text "false" bought.
+    if cfg.get("allow_fiat_buys") is True and weekly > 0 and week_spent is None:
         # H1: unknown is not zero. A week that cannot be totalled buys nothing.
         notes.append("R6 contribution: the week's record of dollar buys cannot be read "
                      "(a row is missing, not finite or not above zero) -- nothing is "
                      "contributed until it is repaired")
-    elif cfg.get("allow_fiat_buys") and weekly > 0:
+    elif cfg.get("allow_fiat_buys") is True and weekly > 0:
         floor_pct = float(cfg.get("contribution_min_cash_pct", cfg.get("min_cash_pct", 0.10)))
         cash_after = pf["cash"] + sum(o["usd"] for o in _counted(orders))   # today's trims raise cash first
         spare = cash_after - floor_pct * total

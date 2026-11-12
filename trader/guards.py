@@ -769,7 +769,78 @@ def config_reasons(cfg):
     if "min_order_usd" in cfg and finite_nonnegative(cfg["min_order_usd"]) is None:
         out.append("config: min_order_usd is %r, not a finite number at or above zero "
                    "-- refused" % (cfg["min_order_usd"],))
+    # R4 (2026-11-12): the other numbers that shape an order, each held on the
+    # side its own document states and no further (CONFIG_BOUNDS).
+    for key, (lo, lo_open, hi, hi_open, said) in CONFIG_BOUNDS.items():
+        if key not in cfg:
+            continue
+        v = finite_number(cfg[key])
+        if v is None:
+            out.append("config: %s is %r, not a finite number -- refused" % (key, cfg[key]))
+            continue
+        low_ok = v > lo if lo_open else v >= lo
+        high_ok = v < hi if hi_open else v <= hi
+        if not (low_ok and high_ok):
+            out.append("config: %s is %g, outside %s%g, %g%s -- the bound is set in code "
+                       "(guards.CONFIG_BOUNDS, from %s); refused, not clamped"
+                       % (key, v, "(" if lo_open else "[", lo, hi, ")" if hi_open else "]", said))
+    if ALLOW_FIAT_KEY in cfg and not isinstance(cfg[ALLOW_FIAT_KEY], bool):
+        out.append("config: %s is %r, not true or false -- refused; a permission is not "
+                   "granted by a value that merely looks like yes" % (ALLOW_FIAT_KEY, cfg[ALLOW_FIAT_KEY]))
+    for key in ("symbols", "contribution_symbols"):
+        if key in cfg and (not isinstance(cfg[key], list) or any(
+                not isinstance(x, str) or not x.strip() for x in cfg[key])):
+            out.append("config: %s is %r, not a list of symbols -- refused" % (key, cfg[key]))
     return out
+
+
+# R4 (2026-11-12). Until now three caps had ceilings and every other number in
+# the config was the config's to set in either direction: max_position_pct 0.9
+# switched the concentration rule off, min_cash_pct 0 switched the cash sleeve
+# off, weekly_fiat_budget_usd 100000 was a budget. Each of these is held, in
+# code, on the side its own document states. (lowest, open?, highest, open?,
+# where the number is written.) A config may move a value INSIDE its range;
+# outside it the config is refused -- every cycle, armed or not -- not clamped.
+CONFIG_BOUNDS = {
+    # MY_STRATEGY.md Rule 1: "No single coin above 20% of your crypto total."
+    "max_position_pct": (0.0, True, 0.20, False, "MY_STRATEGY.md Rule 1: no single coin above 20%"),
+    # README, "What has to say yes": "the 10% cash floor"; MY_STRATEGY.md Rule 6.
+    "min_cash_pct": (0.10, False, 1.0, True, "README: the 10% cash floor"),
+    "contribution_min_cash_pct": (0.10, False, 1.0, True,
+                                  "MY_STRATEGY.md Rule 6: nothing is put to work under 10% cash"),
+    # MY_STRATEGY.md Rule 6: "a budget of 100 a week".
+    "weekly_fiat_budget_usd": (0.0, False, 100.0, False, "MY_STRATEGY.md Rule 6: a budget of 100 a week"),
+}
+
+# EVERY GATE-RELEVANT KEY (GATE_KEYS, below), and what holds it. Prose that a
+# test reads: test_r04_config_bounds.py fails if a key is added to GATE_KEYS
+# and not accounted for here.
+CONFIG_KEY_NOTES = {
+    "armed": "no bound: a boolean; counts only as the boolean true with an unexpired armed_until (H7)",
+    "armed_until": "bound: in the future and at most 24 hours ahead (guards.ARMED_MAX_S, H7)",
+    "max_order_usd": "bound: at most $25 (HARD_CEILINGS, H5); a config may lower it",
+    "max_daily_notional_usd": "bound: at most $50 (HARD_CEILINGS, H5); a config may lower it",
+    "max_orders_per_day": "bound: at most 2, a whole number (HARD_CEILINGS, H5); a config may lower it",
+    "min_order_usd": "no bound beyond finite and not negative: raising it only refuses more orders, "
+                     "lowering it only allows smaller ones inside the same caps",
+    "max_position_pct": "bound: above 0 and at most 0.20 (CONFIG_BOUNDS, R4)",
+    "min_cash_pct": "bound: at least 0.10 and below 1 (CONFIG_BOUNDS, R4)",
+    "seal_required": "bound when armed: must be true (witness.terms_reasons, SW3)",
+    "min_sealed_signals": "bound when armed: a whole number, at least 30 (live_terms_reasons, H6)",
+    "rule5_require_significance": "bound when armed: must be true (live_terms_reasons, H6)",
+    "daily_plan_required": "bound when armed: must be true (live_terms_reasons, H6)",
+    "rule5_waiver": "bound when armed: refused (live_terms_reasons, H6); honoured disarmed only",
+    "trading_scope": "bound when armed: open_reserve_pct at least 0.50 (live_terms_reasons, H6)",
+    "allow_fiat_buys": "no bound: a permission that is the operator's to give; must be exactly "
+                       "true or false (R4), and absent means no",
+    "weekly_fiat_budget_usd": "bound: 0 to $100 (CONFIG_BOUNDS, R4)",
+    "contribution_min_cash_pct": "bound: at least 0.10 and below 1 (CONFIG_BOUNDS, R4)",
+    "contribution_symbols": "no bound: it can only NARROW what the weekly contribution buys; "
+                            "must be a list of symbols (R4)",
+    "symbols": "no bound: it can only NARROW what is traded, and what it leaves out is still "
+               "counted in the book (R3); must be a list of symbols (R4)",
+    "covenant_home": "bound when armed: must be the pinned witness folder (witness.home_reasons, H6)",
+}
 
 
 def caps(path: Optional[str] = None) -> dict:
@@ -1675,6 +1746,11 @@ def preconditions(order, cfg=None, st=None, sealed_ok=None, guard_blocks=None,
     bad.extend(config_reasons({k: (cfg[k] if k in cfg else c[k])
                                for k in ("max_order_usd", "max_daily_notional_usd",
                                          "max_orders_per_day", "min_order_usd")}))
+    # R4: and every other bounded number in the config (CONFIG_BOUNDS), which
+    # have no fallback to resolve first.
+    for r in config_reasons(cfg):
+        if r not in bad:
+            bad.append(r)
 
     gs = State(equity_now=0.0, equity_peak=0.0, equity_start_of_day=0.0,
                closed_trades=[], last_sold={}, positions={}, cash=0.0,
