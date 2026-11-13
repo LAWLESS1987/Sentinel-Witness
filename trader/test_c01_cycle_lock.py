@@ -6,6 +6,7 @@ import inspect
 import os
 import subprocess
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -133,9 +134,72 @@ with Gated(approved=[SELL], hold_lock=False) as fx:
         used = "ValueError: %s" % e
     check("L10 a permit issued under the lock is not usable after the lock is given back",
           used.startswith("ValueError") and "cycle lock" in used, used)
+    # Review (Codex, 2026-11-12): the first version let that permit work again under a LATER hold, by
+    # which time another cycle could have used up the day. A permit dies with the hold that issued it.
     G.take_cycle_lock()
-    check("L11 ...and is usable once, holding it again", G.consume_permit(permit, "fake", "XLM", "sell") == 20.0)
+    try:
+        G.consume_permit(permit, "fake", "XLM", "sell")
+        again = "consumed"
+    except ValueError as e:
+        again = "ValueError: %s" % e
+    check("L11 ...and it is NOT good again under a later hold: it died when its own hold ended",
+          again.startswith("ValueError") and "no such permit" in again, again)
+    reasons, fresh = G.live_gate(dict(SELL), Venue())
+    check("L11b a permit issued and used under one hold works (the control)",
+          reasons == [] and G.consume_permit(fresh, "fake", "XLM", "sell") == 20.0, reasons)
     G.release_cycle_lock()
+
+# ---- threads (review, Codex 2026-11-12): the lock belongs to the thread that took it -------------------
+with Gated(approved=[SELL], hold_lock=False) as fx:
+    fx.seal([dict(SELL)])
+    ok, _w = G.take_cycle_lock()
+    seen = {}
+
+    def other_thread():
+        seen["take"] = G.take_cycle_lock()
+        seen["holds"] = G.holds_cycle_lock()
+        seen["gate"] = G.live_gate(dict(SELL), Venue())
+        G.release_cycle_lock()                      # must not free the first thread's hold
+    t = threading.Thread(target=other_thread)
+    t.start()
+    t.join(60)
+    check("L18 while one thread holds the lock, another thread of the same process is refused it",
+          ok and seen.get("take", (True,))[0] is False and "another thread" in str(seen["take"][1]) and seen["holds"] is False, seen)
+    check("L19 ...the gate gives that thread no permit, and its release does not free the holder's lock",
+          seen["gate"][1] is None and any("cycle lock" in r for r in seen["gate"][0]) and G.holds_cycle_lock(), seen.get("gate"))
+    G.release_cycle_lock()
+
+# ---- run_once holds the lock for the WHOLE cycle (review: the textual pin below could not show this) -----
+with Gated(approved=[SELL], hold_lock=False) as fx:
+    real_cycle = T._run_cycle
+    during = {}
+
+    def watched_cycle(cfg, plan_only=False):
+        during["held"] = G.holds_cycle_lock()
+        during["other"] = other_cycle_asks(fx.state_path)
+        return "ran"
+    T._run_cycle = watched_cycle
+    try:
+        out = T.run_once(dict(fx.cfg))
+    finally:
+        T._run_cycle = real_cycle
+    check("L20 inside run_once's cycle the lock is held, and a second trader process is refused",
+          out == "ran" and during.get("held") is True and str(during.get("other")).startswith("REFUSED"), during)
+    check("L21 ...and it is given back when the cycle returns", not G.holds_cycle_lock() and other_cycle_asks(fx.state_path) == "TAKEN")
+
+    def failing_cycle(cfg, plan_only=False):
+        raise RuntimeError("a cycle that breaks")
+    T._run_cycle = failing_cycle
+    try:
+        try:
+            T.run_once(dict(fx.cfg))
+            raised = False
+        except RuntimeError:
+            raised = True
+    finally:
+        T._run_cycle = real_cycle
+    check("L22 a cycle that raises still gives the lock back", raised and not G.holds_cycle_lock()
+          and other_cycle_asks(fx.state_path) == "TAKEN")
 
 # ---- this process is the cycle in flight; a second trader process asks ---------------------------
 with Gated(approved=[SELL]) as fx:                      # hold_lock=True: as inside run_once
