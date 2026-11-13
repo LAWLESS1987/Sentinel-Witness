@@ -46,12 +46,17 @@ def check(root="."):
     except OSError:
         return ["README.md could not be read"]
     files = tracked(root)
-    # `./tradeGate.js` and `tradeGate.js` are one name: the list holds it once, without the leading ./
-    named = sorted({n[2:] if n.startswith("./") else n for n in NAMED.findall(readme)})
+    # `./tradeGate.js` and `tradeGate.js` are one name, in the README and in the list alike. Until an outside read
+    # of 2026-11-13 only the README's side was reduced, so a list entry written with ./ was reported twice: as
+    # missing from the list and as no longer named.
+    def one_name(n):
+        return n[2:] if n.startswith("./") else n
+
+    named = sorted({one_name(n) for n in NAMED.findall(readme)})
     absent = sorted(n for n in named if not has(n, files))
     try:
         with open(os.path.join(root, LIST), encoding="utf-8") as fh:
-            listed = sorted({ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")})
+            listed = sorted({one_name(ln.strip()) for ln in fh if ln.strip() and not ln.lstrip().startswith("#")})
     except OSError:
         listed = []
         if absent:

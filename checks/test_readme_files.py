@@ -33,6 +33,22 @@ class Branch(unittest.TestCase):
     def test_a_branch_whose_readme_and_list_agree_has_no_finding(self):
         self.assertEqual(self.findings(), [])
 
+    def test_a_leading_dot_slash_is_the_same_name_in_the_readme_and_in_the_list(self):
+        listed = "# named in README.md, not in this branch\n./tradeGate.js\nsrc/App.jsx\n"
+        self.files["checks/NOT_IN_THIS_BRANCH.txt"] = listed
+        self.assertEqual(self.findings(), [])                                  # ./ in the list, plain in the README
+        self.files["README.md"] = self.files["README.md"].replace("`tradeGate.js`", "`./tradeGate.js`")
+        self.assertEqual(self.findings(), [])                                  # ./ in both
+        self.files["checks/NOT_IN_THIS_BRANCH.txt"] = listed.replace("./tradeGate.js", "tradeGate.js")
+        self.assertEqual(self.findings(), [])                                  # ./ in the README only
+        self.files["checks/NOT_IN_THIS_BRANCH.txt"] = listed.replace("./tradeGate.js\n", "./tradeGate.js\n./gone.js\n")
+        self.assertEqual(len(self.findings()), 1)                              # a ./ entry nobody names is still stale
+        self.assertIn("gone.js, which README.md no longer names", self.findings()[0])
+        self.files["checks/NOT_IN_THIS_BRANCH.txt"] = listed
+        self.files["tradeGate.js"] = "export default 1\n"
+        self.assertEqual(len(self.findings()), 1)                              # and one that is here now is still stale
+        self.assertIn("which is in this branch now", self.findings()[0])
+
     def test_a_bare_name_is_found_anywhere_and_a_path_only_at_that_path(self):
         self.files["README.md"] = "Uses `limits.js` and `lib/limits.js`.\n"
         del self.files["checks/NOT_IN_THIS_BRANCH.txt"]
