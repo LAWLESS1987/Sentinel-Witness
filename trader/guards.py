@@ -2203,16 +2203,32 @@ def holds_cycle_lock():
         return held is not None and held[2] == threading.get_ident()
 
 
-def _issue_permit(venue_name, sym, side, usd):
+def _issue_permit(venue_name, sym, side, usd, armed_until=None):
     """Record a permit for one live order and return its id. Called by
-    live_gate when nothing refused, and by nothing else in this program."""
+    live_gate when nothing refused, and by nothing else in this program.
+
+    C2 (2026-11-13): `armed_until` is the end of the arming the gate judged, in
+    epoch seconds. A permit used to live PERMIT_VALID_S from its issue whatever
+    the arming said, so one issued in the last seconds of an arming could send a
+    live order up to two minutes after the arming had ended. It now ends at the
+    earlier of the two, and consume_permit says which.
+
+    Its life is ALSO counted on the monotonic clock, which nothing can set back:
+    with the wall clock alone, a clock stepped backwards after the issue made an
+    ended arming look like it had time left. And a permit the gate issued is
+    refused once the config on disk no longer says armed, so disarming by hand
+    stops an order that already holds a permit (consume_permit)."""
     import secrets
     now = time.time()
+    ends = finite_number(armed_until) if armed_until is not None else None
+    life = PERMIT_VALID_S if ends is None else max(0.0, min(PERMIT_VALID_S, ends - now))
     for k in [k for k, p in _PERMITS.items() if p["used"] or p["expires"] < now]:
         del _PERMITS[k]
     pid = secrets.token_hex(16)
     _PERMITS[pid] = {"venue": str(venue_name), "sym": str(sym).strip().upper(),
-                     "side": str(side), "usd": float(usd), "expires": now + PERMIT_VALID_S,
+                     "side": str(side), "usd": float(usd),
+                     "expires": now + life, "mono_ends": time.monotonic() + life,
+                     "arming_ends": ends, "capped": ends is not None and life < PERMIT_VALID_S,
                      "used": False}
     return pid
 
@@ -2228,7 +2244,20 @@ def consume_permit(pid, venue_name, sym, side):
         raise ValueError("there is no such permit")
     if p["used"]:
         raise ValueError("the permit has already been used")
-    if time.time() > p["expires"]:
+    now = time.time()
+    over = time.monotonic() >= p.get("mono_ends", float("inf"))   # its life, on the clock that cannot be set back
+    if p.get("arming_ends") is not None:                                         # C2: issued by the gate
+        if now >= p["arming_ends"] or (over and p.get("capped")):
+            raise ValueError("the arming this permit was issued under has ended")
+        # Disarming by hand must stop an order that already holds a permit. The same file the gate read is read
+        # again; one that cannot be read, or no longer says armed, sends nothing.
+        try:
+            still, arm_why = arming(load_config(CONFIG_PATH))
+        except Exception as e:                                                   # noqa: BLE001
+            still, arm_why = False, "the config could not be read (%s)" % type(e).__name__
+        if not still:
+            raise ValueError("the trader is no longer armed: %s" % arm_why)
+    if now > p["expires"] or over:
         raise ValueError("the permit has expired")
     if (p["venue"], p["sym"], p["side"]) != (str(venue_name), str(sym).strip().upper(), str(side)):
         raise ValueError("the permit is for another order")
@@ -2347,7 +2376,13 @@ def live_gate(order, venue, cfg=None, st=None, portfolio=None, caller_blocks=Non
         reasons += key_scope.key_reasons(venue)
     if reasons:
         return reasons, None
-    return [], _issue_permit(name, order["sym"], order["side"], order["usd"])
+    # C2: the permit carries the end of the arming judged above, read from the same config on disk. An end that
+    # cannot be read here is a refusal, never a permit with no end.
+    ends = parse_utc(disk.get("armed_until")) if isinstance(disk, dict) else None
+    if ends is None:
+        return ["live gate: the end of the arming (armed_until) could not be read when the permit was to be "
+                "issued -- refused"], None
+    return [], _issue_permit(name, order["sym"], order["side"], order["usd"], armed_until=ends)
 
 
 # ---- WHICH REASONS ARE A DECISION, AND WHICH ARE THE ABSENCE OF ONE --------
