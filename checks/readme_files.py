@@ -68,7 +68,7 @@ def check(root="."):
     for rel in sorted(files):
         if rel.endswith(".py"):
             try:
-                with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                with open(os.path.join(root, rel), encoding="utf-8-sig") as fh:     # a leading byte-order mark is valid Python
                     compile(fh.read(), rel, "exec")
             except (SyntaxError, ValueError, UnicodeDecodeError) as e:
                 findings.append("%s does not compile (%s)" % (rel, type(e).__name__))
