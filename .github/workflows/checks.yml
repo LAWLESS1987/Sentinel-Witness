@@ -1,0 +1,24 @@
+name: checks
+
+# Does README.md name files this branch has, and does the Python here compile? Reads the branch; fetches nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: The check's own tests, driven both ways
+        run: python3 checks/test_readme_files.py
+      - name: README.md and this branch agree
+        run: python3 checks/readme_files.py

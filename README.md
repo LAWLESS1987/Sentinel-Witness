@@ -15,6 +15,16 @@ dashboard → manual-approval → automated execution, driven by walk-forward-
 validated grid/bracket strategy parameters (see the companion `strategy/`
 Python project) with a real-time adaptive layer on top.
 
+## What is in this branch
+
+Checked 2026-11-13. This branch holds four of the app's files (`Dashboard.jsx`, `AutomatedSetupModal.jsx`, `automatedLimits.js`, `tierNavigation.js`), `covenant_trading_bridge.py`, a copy of `covenant_unified_v8.py` and `requirements.txt`.
+
+It does not hold the rest of the app this README describes. There is no `package.json`, so `npm install` and `npm test` cannot be run from this branch, and the tests the table below describes are not here to run. Every file this README names that is not in this branch is listed in `checks/NOT_IN_THIS_BRANCH.txt`.
+
+The trading engine and its tests are on the `sentinel-trading` branch, which has its own checks.
+
+`python checks/readme_files.py` fails when this README names a file that is neither here nor on that list, and when the list is out of date. GitHub runs it on every push to this branch.
+
 ## What's actually tested vs. what needs your device
 
 This was built in a sandboxed environment with no access to Coinbase/
