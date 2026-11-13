@@ -21,6 +21,8 @@ Checked 2026-11-13. This branch holds four of the app's files (`Dashboard.jsx`, 
 
 It does not hold the rest of the app this README describes. There is no `package.json`, so `npm install` and `npm test` cannot be run from this branch, and the tests the table below describes are not here to run. Every file this README names that is not in this branch is listed in `checks/NOT_IN_THIS_BRANCH.txt`.
 
+What can be run here: `node --test tests/*.test.mjs` (Node 22.7 or newer, nothing to install) runs `tests/automatedLimits.test.mjs`, which tests `automatedLimits.js`. `tierNavigation.js` imports `./tradeGate.js`, which is not in this branch, so it cannot be loaded from here; the same test file pins that, and fails on the day `tradeGate.js` arrives so that real tests replace it. The two `.jsx` files need a browser and a build, and are not tested here.
+
 The trading engine and its tests are on the `sentinel-trading` branch, which has its own checks.
 
 `python checks/readme_files.py` fails when this README names a file that is neither here nor on that list, and when the list is out of date. GitHub runs it on every push to this branch.

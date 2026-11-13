@@ -41,6 +41,12 @@ class Branch(unittest.TestCase):
         self.assertEqual(self.findings(), ["checks/NOT_IN_THIS_BRANCH.txt is missing, and README.md names files that are not here",
                                            "README.md names src/limits.js, which is not in this branch and not in the list of what is not here"])
 
+    def test_a_name_written_with_a_leading_dot_slash_is_the_same_name(self):
+        self.files["README.md"] += "It imports `./tradeGate.js` and `./lib/limits.js`.\n"
+        self.assertEqual(self.findings(), [])
+        self.files["README.md"] += "And `./ledger.js`.\n"
+        self.assertEqual(self.findings(), ["README.md names ledger.js, which is not in this branch and not in the list of what is not here"])
+
     def test_a_named_file_that_is_missing_and_not_listed(self):
         self.files["README.md"] += "Also `ledger.js`.\n"
         self.assertEqual(self.findings(), ["README.md names ledger.js, which is not in this branch and not in the list of what is not here"])

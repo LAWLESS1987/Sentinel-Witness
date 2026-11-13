@@ -18,7 +18,7 @@ import os
 import re
 import sys
 
-NAMED = re.compile(r"`([A-Za-z0-9_./-]+\.(?:js|jsx|ts|tsx|py|json|png|md|txt|yml|yaml|html|css))`")
+NAMED = re.compile(r"`([A-Za-z0-9_./-]+\.(?:js|mjs|jsx|ts|tsx|py|json|png|md|txt|yml|yaml|html|css))`")
 LIST = os.path.join("checks", "NOT_IN_THIS_BRANCH.txt")
 
 
@@ -46,7 +46,8 @@ def check(root="."):
     except OSError:
         return ["README.md could not be read"]
     files = tracked(root)
-    named = sorted(set(NAMED.findall(readme)))
+    # `./tradeGate.js` and `tradeGate.js` are one name: the list holds it once, without the leading ./
+    named = sorted({n[2:] if n.startswith("./") else n for n in NAMED.findall(readme)})
     absent = sorted(n for n in named if not has(n, files))
     try:
         with open(os.path.join(root, LIST), encoding="utf-8") as fh:
