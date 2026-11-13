@@ -1,0 +1,20 @@
+# Files README.md names that are NOT in this branch. Measured 2026-11-13 by checks/readme_files.py.
+# The check fails when README.md names a missing file that is not listed here, and when a file listed here is no
+# longer named or has been added. So this list is always exactly what a reader will not find.
+App.jsx
+cryptocom.js
+exchanges/coinbase.js
+exchanges/kraken.js
+gridMath.js
+icon-192.png
+icon-512.png
+ledger.js
+package.json
+recursive_strategy_optimizer.py
+secureStorage.js
+src/lib/__tests__/automatedLimits.test.js
+src/lib/__tests__/tierNavigation.test.js
+src/lib/automatedLimits.js
+src/lib/strategyGuide.js
+tradeGate.js
+vite.config.js

@@ -1,0 +1,33 @@
+name: checks
+
+# Does README.md name files this branch has, and does the Python here compile? Reads the branch; fetches nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: The check's own tests, driven both ways
+        run: python3 checks/test_readme_files.py
+      - name: README.md and this branch agree
+        run: python3 checks/readme_files.py
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - name: The JavaScript that can be loaded from this branch
+        # node --test passes a glob that matches nothing as "tests 0", exit 0; no test file is not a pass.
+        run: |
+          set -- tests/*.test.mjs
+          if [ ! -e "$1" ]; then echo "no test file found -- that is not a pass"; exit 1; fi
+          node --test "$@"
