@@ -227,6 +227,7 @@ SIZE = 20.0 / (2.0 * 1.01)
 def permit(venue, sym, side, usd):
     """A permit as guards.live_gate records one, for driving a real adapter's
     live path over a stubbed transport. (The gate itself is test_r01's.)"""
+    G.take_cycle_lock()      # C1: a permit is used only by a process holding the cycle lock
     return G._issue_permit(venue, sym, side, usd)
 
 

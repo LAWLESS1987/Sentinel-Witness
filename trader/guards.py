@@ -2094,6 +2094,95 @@ def state_differs(handed, disk):
     return [k for k in STATE_GATE_KEYS if not _same_value(a.get(k), b.get(k))]
 
 
+# ---- ONE CYCLE AT A TIME (C1, 2026-11-12) -----------------------------------
+# Found by an outside review and reproduced: two cycles that read the same state
+# file before either wrote to it BOTH passed the gate -- "the state handed in
+# differs from the file" cannot tell them apart, because neither differs -- and
+# each one's save then dropped the other's pending row, so the day's count was
+# one short and the per-day ceilings could be passed. The scheduled task and a
+# cycle started by hand are two such cycles.
+#
+# The lock is the operating system's, on a file beside the state file: a byte
+# range on Windows (msvcrt), flock elsewhere. It is taken without waiting and
+# belongs to the open handle, so the system drops it when the process ends,
+# however it ends. There is no "stale lock" to judge and no pid or timestamp in
+# the file to believe or forge. A cycle that cannot take it does nothing.
+#
+# What requires it: run_once (the whole cycle), execute, save_state, the gate
+# (no permit without it) and consume_permit (no send without it).
+#
+# WHAT IT IS NOT. Like everything in this file it is a rule for well-behaved
+# code under one account. Another process of the same account can hold the lock
+# for ever (every cycle then refuses: it fails closed), and on POSIX it can
+# unlink the file while a cycle holds it, after which a second cycle locks a new
+# file of the same name. Windows refuses to delete a file that is open this way.
+_CYCLE_LOCKS = {}            # lock path -> [file descriptor, depth]
+
+
+def cycle_lock_path():
+    return TRADER_STATE + ".lock"
+
+
+def _lock_fd(fd, take):
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
+
+
+def take_cycle_lock():
+    """(True, None) when this process holds the trader's cycle lock -- newly, or
+    once more (it counts, so a holder may ask again) -- else (False, why). Never
+    waits. Every True is owed one release_cycle_lock()."""
+    path = cycle_lock_path()
+    held = _CYCLE_LOCKS.get(path)
+    if held is not None:
+        held[1] += 1
+        return True, None
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return False, "the trader's cycle lock %s cannot be opened (%s)" % (path, type(e).__name__)
+    try:
+        _lock_fd(fd, True)
+    except OSError:
+        os.close(fd)
+        return False, "another trader cycle holds the cycle lock %s" % path
+    except Exception as e:                                       # noqa: BLE001
+        os.close(fd)
+        return False, "the trader's cycle lock %s cannot be taken (%s)" % (path, type(e).__name__)
+    _CYCLE_LOCKS[path] = [fd, 1]
+    return True, None
+
+
+def release_cycle_lock():
+    """Give back one take_cycle_lock(); the last one frees the lock."""
+    path = cycle_lock_path()
+    held = _CYCLE_LOCKS.get(path)
+    if held is None:
+        return
+    held[1] -= 1
+    if held[1] > 0:
+        return
+    del _CYCLE_LOCKS[path]
+    try:
+        _lock_fd(held[0], False)
+    except Exception:                                            # noqa: BLE001
+        pass                                                     # closing the handle frees it too
+    try:
+        os.close(held[0])
+    except OSError:
+        pass
+
+
+def holds_cycle_lock():
+    return cycle_lock_path() in _CYCLE_LOCKS
+
+
 def _issue_permit(venue_name, sym, side, usd):
     """Record a permit for one live order and return its id. Called by
     live_gate when nothing refused, and by nothing else in this program."""
@@ -2115,6 +2204,8 @@ def consume_permit(pid, venue_name, sym, side):
     p = _PERMITS.get(pid) if isinstance(pid, str) else None
     if p is None:
         raise ValueError("there is no such permit")
+    if not holds_cycle_lock():                                   # C1
+        raise ValueError("this process does not hold the trader's cycle lock")
     if p["used"]:
         raise ValueError("the permit has already been used")
     if time.time() > p["expires"]:
@@ -2142,6 +2233,12 @@ def live_gate(order, venue, cfg=None, st=None, portfolio=None, caller_blocks=Non
     name = getattr(venue, "name", None)
     if venue is None or not isinstance(name, str):
         return ["live gate: no venue to send the order to"], None
+
+    # -- one cycle at a time (C1) -------------------------------------------------
+    if not holds_cycle_lock():
+        reasons.append("live gate: this process does not hold the trader's cycle lock (%s), so "
+                       "another cycle could be counting the same day's orders -- refused"
+                       % cycle_lock_path())
 
     # -- the config, from disk -------------------------------------------------
     cstate = path_state(CONFIG_PATH)

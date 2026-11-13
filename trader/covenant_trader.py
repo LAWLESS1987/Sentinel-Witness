@@ -157,6 +157,11 @@ def load_config():
     return cfg
 
 
+class StateBusy(Exception):
+    """Another process holds the trader's cycle lock, so the state file is not
+    this one's to write. C1 (2026-11-12): see guards.take_cycle_lock."""
+
+
 class StateUnreadable(Exception):
     """The state file exists and cannot be read, parsed or made sense of. H2.
 
@@ -275,9 +280,22 @@ def save_state(st):
     # file on disk is read again here, at the last moment, whatever the caller
     # believes about it: if it is there and unreadable this raises, and the
     # unreadable bytes stay as they are.
-    _read_state_file(STATE)
-    import durable
-    durable.write_json(STATE, st, indent=2)
+    # C1 (2026-11-12): NEVER WRITE WHILE ANOTHER PROCESS IS MID-CYCLE. Inside a
+    # cycle the lock is already this process's and this only counts; outside one
+    # it is taken for the write, and a write that cannot take it raises instead
+    # of dropping the rows the other cycle has recorded.
+    took = False
+    if _guards is not None:
+        took, lock_why = _guards.take_cycle_lock()
+        if not took:
+            raise StateBusy(lock_why)
+    try:
+        _read_state_file(STATE)
+        import durable
+        durable.write_json(STATE, st, indent=2)
+    finally:
+        if took:
+            _guards.release_cycle_lock()
 
 
 class ClockWentBack(Exception):
@@ -1247,6 +1265,24 @@ def venue_for(order, live_venues):
 
 def execute(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
             may_buy=None, approval=None, portfolio=None):
+    """C1 (2026-11-12): the orders are judged, recorded as pending and sent while
+    THIS process holds the trader's cycle lock, so no other cycle can count the
+    day between this one's gate and this one's record. Inside run_once the lock
+    is already held and this only counts. If it cannot be taken the orders are
+    still walked -- and the gate refuses every one of them, naming the lock."""
+    took = False
+    if _guards is not None:
+        took, _why = _guards.take_cycle_lock()
+    try:
+        return _execute_cycle(cfg, st, orders, sealed_ok, guard_blocks, plan_only,
+                              may_buy=may_buy, approval=approval, portfolio=portfolio)
+    finally:
+        if took:
+            _guards.release_cycle_lock()
+
+
+def _execute_cycle(cfg, st, orders, sealed_ok, guard_blocks, plan_only=False,
+                   may_buy=None, approval=None, portfolio=None):
     """`may_buy` -- optional callable sym -> [blocking guard names]. A83.
 
     THE GUARD STACK WAS ASKED WITHOUT A SYMBOL, so the asset-specific guards
@@ -1525,6 +1561,28 @@ def rehearsal_lines(cfg):
 
 
 def run_once(cfg, plan_only=False):
+    """C1 (2026-11-12): ONE CYCLE AT A TIME. The whole cycle -- reading the state,
+    measuring the book, the gate, the pending rows, the sends, the last save --
+    runs holding the trader's cycle lock (guards.take_cycle_lock). A cycle that
+    finds another one running does nothing and says so; main() exits 4."""
+    global LAST_REFUSAL
+    if _guards is None:
+        return _run_cycle(cfg, plan_only)        # no gate either: nothing can go live
+    took, lock_why = _guards.take_cycle_lock()
+    if not took:
+        LAST_REFUSAL = ("%s -- two cycles at once could each count the day's orders before "
+                        "the other recorded its own, so this one did nothing" % lock_why)
+        hr("SENTINEL-WITNESS TRADER -- REFUSING THIS CYCLE")
+        print("  " + LAST_REFUSAL)
+        print("  Nothing was read, planned, sealed or sent.")
+        return None
+    try:
+        return _run_cycle(cfg, plan_only)
+    finally:
+        _guards.release_cycle_lock()
+
+
+def _run_cycle(cfg, plan_only=False):
     global LAST_REFUSAL
     LAST_REFUSAL = None
     # H7 (2026-11-12): AN ARMING THAT IS NOT COMPLETE AND CURRENT IS NO ARMING.
