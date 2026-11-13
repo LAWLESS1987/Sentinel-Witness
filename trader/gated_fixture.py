@@ -47,7 +47,11 @@ def until(seconds=3600):
 class Gated:
     """with Gated(approved=[order, ...]) as fx: fx.seal(orders); fx.execute(orders, [venue])"""
 
-    def __init__(self, approved=(), cfg=None, state=None, gate=None, approval=None, decisions=None):
+    def __init__(self, approved=(), cfg=None, state=None, gate=None, approval=None, decisions=None,
+                 hold_lock=True):
+        # C1: a cycle holds the trader's cycle lock from start to finish, as run_once does.
+        # hold_lock=False leaves it to execute() and lets a test put another holder in the way.
+        self._hold_lock, self._locked = bool(hold_lock), False
         self._approved = [{"sym": o["sym"], "side": o["side"], "usd": o["usd"]} for o in approved]
         self._cfg_over, self._state_over = dict(cfg or {}), dict(state or {})
         self.gate = list(gate or [])            # covenant's yes/no for the day: [] is yes
@@ -123,9 +127,14 @@ class Gated:
         del W._SEALED[:]
         self.cfg = G.load_config(self.config_path)
         self.st = T.load_state()
+        if self._hold_lock:
+            self._locked, _why = G.take_cycle_lock()
         return self
 
     def __exit__(self, *exc):
+        if self._locked:
+            G.release_cycle_lock()
+            self._locked = False
         for (mod, name), val in self._keep.items():
             setattr(mod, name, val)
         W._SEALED[:] = self._sealed_keep

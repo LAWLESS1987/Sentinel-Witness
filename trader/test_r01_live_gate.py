@@ -399,6 +399,7 @@ try:
         got = attempt(lambda: ven.place("XLM", "sell", QTY, live=True, ref_px=1.0, permit="f" * 32))
         check("G2 ...nor with a permit id the caller made up", got.startswith("refused") and booked() == [], (got, sent))
 
+    G.take_cycle_lock()      # C1: a permit is used only by a process holding the cycle lock
     k = Kraken()
     del sent[:]
     for label, pid, args in (

@@ -123,6 +123,7 @@ check("F6 a size, limit, reference or declared figure that is NaN, infinite, zer
 
 
 def permit(venue, sym, side, usd):
+    G.take_cycle_lock()      # C1: a permit is used only by a process holding the cycle lock
     return G._issue_permit(venue, sym, side, usd)
 
 
