@@ -186,7 +186,26 @@ with Gated(approved=[SELL]) as fx:
 # ---- the gate hands the arming's end to the permit: pinned so a rewrite cannot drop it quietly ---
 src = inspect.getsource(G.live_gate)
 check("P16 live_gate issues the permit with the arming's end", "armed_until=ends" in src and 'parse_utc(disk.get("armed_until"))' in src)
-check("P17 live_gate refuses when that end cannot be read", "could not be read when the permit was to be" in src)
+check("P17 live_gate refuses when that end cannot be read (a pin on the text: arming() refuses first, so the branch "
+      "cannot be reached through the gate)",
+      'if ends is None:\n        return ["live gate: the end of the arming (armed_until) could not be read' in src.replace("\r\n", "\n"))
+
+with Gated(approved=[SELL]) as fx:
+    fx.seal([dict(SELL)])
+    reasons, permit = G.live_gate(dict(SELL), Venue())
+    real_load = G.load_config
+
+    def cannot_read(*a, **k):
+        raise OSError("the disk went away")
+    G.load_config = cannot_read
+    try:
+        said = refused(lambda: G.consume_permit(permit, "fake", "XLM", "sell"))
+    finally:
+        G.load_config = real_load
+    check("P28 a config whose read raises when the permit is used sends nothing, and says the config could not be read",
+          said is not None and "no longer armed" in said and "could not be read (OSError)" in said, said)
+    check("P29 ...and once it can be read again the same permit is good",
+          G.consume_permit(permit, "fake", "XLM", "sell") == 20.0)
 check("P18 consume_permit asks about the arming before the permit's own time",
       inspect.getsource(G.consume_permit).index("arming_ends") < inspect.getsource(G.consume_permit).index('"the permit has expired"'))
 
