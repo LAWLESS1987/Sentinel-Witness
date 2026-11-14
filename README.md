@@ -10,6 +10,8 @@ tags:
 
 # Ledger Trading Dashboard
 
+> **Notice, 2026-11-14: the core copy in this branch is old.** `covenant_unified_v8.py` is an old copy of another project's core. It is not maintained here, and it must not be exposed to a network: its API has no authentication. Since this change its API listens on loopback (127.0.0.1) unless a host is given explicitly, and `POST /peers` and `POST /crisis/clear` answer 403 to any caller that is not on loopback. Nothing else in it was fixed: with no host given, its peer and bridge sockets still listen on every interface. `python tests/test_core_loopback.py` checks the two routes and the default (it needs flask, cryptography and waitress from `requirements.txt`).
+
 Phone-first PWA: Ledger hardware wallet + Coinbase/Kraken/Crypto.com, staged
 dashboard → manual-approval → automated execution, driven by walk-forward-
 validated grid/bracket strategy parameters (see the companion `strategy/`

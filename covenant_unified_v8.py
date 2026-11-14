@@ -273,6 +273,28 @@ PATCH LOG — v7.2 (balance ledger + /stake signature requirement)
 #      round-trip (GET /chain) still succeeds -- see session notes.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# PATCH LOG -- 2026-11-14 (review finding K7): LOOPBACK ONLY, IN THIS COPY
+# ----------------------------------------------------------------
+#   P. This file is an OLD COPY of another project's core, carried in this
+#      repository and not maintained here. Docstring items 3 and 4 above
+#      still stand: there is no API authentication. The smallest change
+#      that is safe in the meantime, and nothing more:
+#        - POST /peers and POST /crisis/clear answer 403 to a caller whose
+#          address is not loopback (see _is_loopback_addr). No new
+#          authentication scheme; every other route is as it was.
+#        - The API listens on API_DEFAULT_HOST (loopback) when no host is
+#          given. This is the decision item O above left open. A host
+#          passed to CovenantUnifiedMaster or CovenantAPI is used as
+#          before, for the API and for the peer sockets alike.
+#      NOT CHANGED, STATED PLAINLY: with no host given the P2P and bridge
+#      sockets still listen on every interface, as before. Every other
+#      route is still unauthenticated. A reverse proxy on this machine
+#      would make every caller look like loopback. Do not expose this
+#      copy to a network.
+#      Tests: tests/test_core_loopback.py (red before, green after).
+# ---------------------------------------------------------------------------
+
 
 
 import json
@@ -284,6 +306,7 @@ import socket
 import secrets
 import base64
 import argparse
+import ipaddress
 import sys
 import ast
 import re
@@ -2724,8 +2747,24 @@ class P2PNode:
 # API Layer
 # ---------------------------------------------------------------------------
 
+# K7 (2026-11-14, PATCH LOG item P): where the API listens when no host is given.
+API_DEFAULT_HOST = "127.0.0.1"
+LOOPBACK_ONLY_MESSAGE = "is accepted from loopback only in this copy of the core (not authenticated; see PATCH LOG item P)"
+
+
+def _is_loopback_addr(addr: Optional[str]) -> bool:
+    """True only for a loopback caller (127.0.0.0/8, ::1, or either written as an IPv4-mapped IPv6 address).
+    No address, or one that does not parse, is not loopback: the answer when unsure is no."""
+    try:
+        ip = ipaddress.ip_address((addr or "").split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
+
+
 class CovenantAPI:
-    def __init__(self, node: P2PNode, db: Database, host: str = "0.0.0.0", port: int = 5000):
+    def __init__(self, node: P2PNode, db: Database, host: str = API_DEFAULT_HOST, port: int = 5000):
         self.node = node
         self.db = db
         self.host = host
@@ -2743,12 +2782,15 @@ class CovenantAPI:
 
         @self.app.route("/peers", methods=["POST"])
         def add_peer():
+            if not _is_loopback_addr(request.remote_addr):                # K7: see PATCH LOG item P
+                return jsonify({"status": "error", "message": "POST /peers " + LOOPBACK_ONLY_MESSAGE}), 403
             data = request.json or {}
             pid, host, port = data.get("peer_id"), data.get("host"), data.get("port")
             if not all([pid, host, port]):
                 return jsonify({"status": "error", "message": "Missing fields"}), 400
             # Audited now (china had this, weird_science didn't). Still NOT
-            # authenticated -- anyone can register a peer. See docstring item 4.
+            # authenticated -- any caller on loopback can register a peer (a
+            # caller elsewhere is refused above since 2026-11-14). See docstring item 4.
             self.db.save_peer_registration({
                 "peer_id": pid, "host": host, "port": port, "source_addr": request.remote_addr,
                 "accepted": True, "reject_reason": None, "timestamp": time.time()
@@ -3118,6 +3160,9 @@ class CovenantAPI:
         @self.app.route("/crisis/clear", methods=["POST"])
         def clear_crisis():
             # Trusted-operator action. Not authenticated -- see docstring item 3.
+            # Since 2026-11-14 (K7, PATCH LOG item P) only a caller on loopback is served.
+            if not _is_loopback_addr(request.remote_addr):
+                return jsonify({"status": "error", "message": "POST /crisis/clear " + LOOPBACK_ONLY_MESSAGE}), 403
             self.node.crisis_mode = False
             self.node.crisis_reason = ""
             return jsonify({"status": "success", "message": "crisis_mode cleared"})
@@ -3202,8 +3247,14 @@ class CovenantAPI:
 # ---------------------------------------------------------------------------
 
 class CovenantUnifiedMaster:
-    def __init__(self, node_id: str, host: str = "0.0.0.0", port: int = 5000,
+    def __init__(self, node_id: str, host: Optional[str] = None, port: int = 5000,
                  p2p_port: Optional[int] = None, db_path: Optional[str] = None):
+        # K7 (2026-11-14, PATCH LOG item P): host=None means the operator gave none. The API then listens on
+        # loopback; the P2P and bridge sockets keep the default they had ("0.0.0.0" -- not changed here). A host
+        # that is given is used for all three, exactly as before.
+        api_host = host if host is not None else API_DEFAULT_HOST
+        if host is None:
+            host = "0.0.0.0"
         if p2p_port is None:
             p2p_port = port + 1
         if db_path is None:
@@ -3246,7 +3297,7 @@ class CovenantUnifiedMaster:
                 self.node.governor.update(b)
 
         self._integrity_breach_count = 0
-        self.api = CovenantAPI(self.node, self.db, host, port)
+        self.api = CovenantAPI(self.node, self.db, api_host, port)
 
     def run(self):
         threading.Thread(target=self.api.run, daemon=True).start()
